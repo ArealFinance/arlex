@@ -1,0 +1,5 @@
+error: close target not found
+ --> tests/cases/accounts_close_not_found.rs:5:23
+  |
+5 |     #[account(close = ghost)]
+  |                       ^^^^^

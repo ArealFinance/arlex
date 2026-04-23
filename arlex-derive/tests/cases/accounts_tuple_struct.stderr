@@ -1,0 +1,5 @@
+error: Accounts must have named fields
+ --> tests/cases/accounts_tuple_struct.rs:4:1
+  |
+4 | pub struct Bad<'info>(&'info AccountView);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

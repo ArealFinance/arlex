@@ -1,0 +1,5 @@
+error: unknown constraint: foobar
+ --> tests/cases/accounts_unknown_constraint.rs:6:15
+  |
+6 |     #[account(foobar)]
+  |               ^^^^^^

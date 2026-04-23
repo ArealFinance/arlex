@@ -1,0 +1,5 @@
+error: payer field not found
+ --> tests/cases/accounts_payer_not_found.rs:5:29
+  |
+5 |     #[account(init, payer = ghost, space = 100)]
+  |                             ^^^^^

@@ -1,0 +1,19 @@
+[package]
+name = "arlex-derive"
+version = "0.1.0"
+edition = "2021"
+description = "Proc macros for the Arlex Solana framework"
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+trybuild = "1"
+arlex-lang = { path = "../arlex-lang" }

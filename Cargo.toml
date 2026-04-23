@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "arlex-lang",
+    "arlex-derive",
+    "arlex-cli",
+    "examples/counter",
+    "examples/token-vault",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Areal Finance"]
+repository = "https://github.com/ArealFinance/arlex"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+overflow-checks = true

@@ -1,0 +1,5 @@
+error: has_one requires account_type for security. Use: has_one = field, account_type = "AccountStructName"
+ --> tests/cases/accounts_has_one_no_type.rs:8:30
+  |
+8 |     #[account(mut, has_one = authority)]
+  |                              ^^^^^^^^^

@@ -1,0 +1,16 @@
+[package]
+name = "arlex-lang"
+version = "0.1.0"
+edition = "2021"
+description = "Arlex - Solana framework built on Pinocchio. 14x cheaper deploys."
+license = "Apache-2.0"
+
+[dependencies]
+arlex-derive = { path = "../arlex-derive" }
+pinocchio = { version = "0.10", features = ["cpi"] }
+pinocchio-token = "0.5"
+pinocchio-system = "0.5"
+pinocchio-associated-token-account = "0.3"
+pinocchio-memo = "0.3"
+solana-program-log = "1.1"
+sha2 = "0.10"

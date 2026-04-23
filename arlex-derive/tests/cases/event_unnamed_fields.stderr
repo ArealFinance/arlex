@@ -1,0 +1,5 @@
+error: #[event] requires named fields
+ --> tests/cases/event_unnamed_fields.rs:5:1
+  |
+5 | pub struct Bad(u64);
+  | ^^^^^^^^^^^^^^^^^^^^

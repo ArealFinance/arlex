@@ -1,0 +1,5 @@
+error: has_one target not found
+ --> tests/cases/accounts_has_one_not_found.rs:5:25
+  |
+5 |     #[account(has_one = ghost)]
+  |                         ^^^^^

@@ -1,0 +1,8 @@
+error: Accounts must be a struct
+ --> tests/cases/accounts_on_enum.rs:5:1
+  |
+5 | / pub enum Bad {
+6 | |     A,
+7 | |     B,
+8 | | }
+  | |_^

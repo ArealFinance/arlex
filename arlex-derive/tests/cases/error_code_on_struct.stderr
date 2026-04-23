@@ -1,0 +1,5 @@
+error: expected `enum`
+ --> tests/cases/error_code_on_struct.rs:4:5
+  |
+4 | pub struct Bad {
+  |     ^^^^^^

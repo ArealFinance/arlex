@@ -1,0 +1,13 @@
+error[E0658]: file modules in proc macro input are unstable
+ --> tests/cases/program_empty_mod.rs:4:1
+  |
+4 | pub mod empty;
+  | ^^^^^^^^^^^^^^
+  |
+  = note: see issue #54727 <https://github.com/rust-lang/rust/issues/54727> for more information
+
+error: #[program] module must have a body
+ --> tests/cases/program_empty_mod.rs:4:1
+  |
+4 | pub mod empty;
+  | ^^^^^^^^^^^^^^

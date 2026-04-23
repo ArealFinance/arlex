@@ -1,0 +1,5 @@
+error: #[account] only supports named fields
+ --> tests/cases/account_unnamed_fields.rs:5:1
+  |
+5 | pub struct Bad(u64, u64);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^

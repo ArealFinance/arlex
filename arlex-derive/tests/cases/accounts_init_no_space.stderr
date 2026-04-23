@@ -1,0 +1,5 @@
+error: init requires both 'payer' and 'space' constraints
+  --> tests/cases/accounts_init_no_space.rs:10:9
+   |
+10 |     pub data: &'info AccountView,
+   |         ^^^^
