@@ -28,9 +28,19 @@ pub use pinocchio_memo as memo;
 
 /// Context passed to instruction handlers.
 /// `T` is the validated Accounts struct from #[derive(Accounts)].
+///
+/// R46 (Layer 10 closure): `accounts` is heap-allocated via `Box<T>`. The
+/// SBF compiler's union analysis would otherwise reserve worst-case stack
+/// for the largest `T` across all match arms in the entrypoint dispatcher.
+/// For programs with many handlers (e.g. native-dex with 14 ix and a
+/// 22-field ZapLiquidity struct), this pushes the dispatcher's frame past
+/// the BPF Loader v3 4096-byte limit. Box-allocating moves `T` to the heap;
+/// `Box<T>` itself is an 8-byte pointer on the dispatcher's stack. Handlers
+/// access fields transparently via `Box<T>: Deref<Target = T>` — no
+/// consumer-side change required.
 pub struct Context<'a, T> {
     pub program_id: &'a Address,
-    pub accounts: T,
+    pub accounts: Box<T>,
     pub remaining_accounts: &'a [AccountView],
 }
 
@@ -97,6 +107,14 @@ pub mod prelude {
     pub use pinocchio::Address;
     pub use pinocchio::Address as Pubkey;
 }
+
+/// R46 (Layer 10 closure): re-export `alloc::boxed::Box` so the
+/// `#[program]` + `#[derive(Accounts)]` macro-emitted code can reference
+/// `arlex_lang::Box` without requiring every consumer to add
+/// `extern crate alloc;` to its lib.rs. Areal contracts already declare
+/// `extern crate alloc` for their own use; example crates and external
+/// consumers inherit it transparently via this re-export.
+pub use alloc::boxed::Box;
 
 // ============================================================
 // Instruction argument deserialization

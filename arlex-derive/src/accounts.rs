@@ -461,6 +461,12 @@ pub fn generate(input: DeriveInput) -> Result<TokenStream> {
     // Check if struct has lifetime parameter
     let has_lifetime = generics.lifetimes().count() > 0;
 
+    // R46 (Layer 10 closure): validate returns `Box<Self>` so the SBF
+    // dispatcher's worst-case match-arm union doesn't reserve worst-case
+    // stack for the largest Accounts struct across all ix. Heap allocation
+    // moves the field-references (~16-24B per field) off the dispatcher
+    // frame; the Box itself is 8 bytes on stack. Consumers access fields
+    // transparently via `Box<T>: Deref<Target = T>`.
     let (validate_sig, impl_block) = if has_lifetime {
         // Struct has 'info lifetime — tie it to accounts parameter
         (
@@ -468,7 +474,7 @@ pub fn generate(input: DeriveInput) -> Result<TokenStream> {
                 pub fn validate(
                     accounts: &'info [pinocchio::AccountView],
                     program_id: &pinocchio::Address,
-                ) -> core::result::Result<Self, pinocchio::error::ProgramError>
+                ) -> core::result::Result<arlex_lang::Box<Self>, pinocchio::error::ProgramError>
             },
             quote! { impl #generics #name #generics },
         )
@@ -478,7 +484,7 @@ pub fn generate(input: DeriveInput) -> Result<TokenStream> {
                 pub fn validate(
                     accounts: &[pinocchio::AccountView],
                     program_id: &pinocchio::Address,
-                ) -> core::result::Result<Self, pinocchio::error::ProgramError>
+                ) -> core::result::Result<arlex_lang::Box<Self>, pinocchio::error::ProgramError>
             },
             quote! { impl #name },
         )
@@ -498,9 +504,9 @@ pub fn generate(input: DeriveInput) -> Result<TokenStream> {
                 #(#validations)*
                 #(#post_validations)*
 
-                Ok(Self {
+                Ok(arlex_lang::Box::new(Self {
                     #(#field_assignments),*
-                })
+                }))
             }
         }
     })

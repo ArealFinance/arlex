@@ -75,7 +75,9 @@ pub fn generate(module: ItemMod) -> Result<TokenStream> {
                 quote! {
                     let ctx = arlex_lang::Context {
                         program_id,
-                        accounts: (),
+                        // R46: Context.accounts is Box<T> for stack-frame
+                        // discipline; () handlers carry a zero-sized Box.
+                        accounts: arlex_lang::Box::new(()),
                         remaining_accounts: accounts,
                     };
                 }
