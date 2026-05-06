@@ -5,3 +5,4 @@ export { instructionDiscriminator, accountDiscriminator, eventDiscriminator } fr
 export { serializeArgs, deserializeAccount, buildTypeRegistry } from './serialization';
 export type { TypeRegistry } from './serialization';
 export { ArlexProgramError, decodeError, extractErrorCode } from './errors';
+export * from './codegen';
