@@ -1,26 +1,38 @@
 {
   "name": "@arlex/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lightweight TypeScript client for Arlex Solana programs",
   "license": "Apache-2.0",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "bin": {
+    "arlex-cli": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "require": "./dist/index.js"
+    },
+    "./codegen-runtime": {
+      "types": "./dist/codegen-runtime.d.ts",
+      "import": "./dist/codegen-runtime.mjs",
+      "require": "./dist/codegen-runtime.js"
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts",
-    "test": "vitest run"
+    "build": "tsup && chmod +x dist/cli.js",
+    "test": "vitest run",
+    "codegen:check": "node scripts/codegen-check.mjs"
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.0",
-    "bs58": "^6.0.0"
+    "bs58": "^6.0.0",
+    "commander": "^12.1.0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",
