@@ -15,7 +15,7 @@ import {
   deserializeAccount,
   buildTypeRegistry,
 } from '../../serialization';
-import { accountDiscriminator } from '../../discriminator';
+import { accountDiscriminator, instructionDiscriminator } from '../../discriminator';
 import { remapWireToTs, remapTsToWire } from '../../codegen-runtime';
 import type { IdlField } from '../../types';
 
@@ -131,6 +131,50 @@ describe('synthetic encode/decode roundtrip', () => {
     for (const name of ['Pool', 'StakingPool', 'OtConfig', 'YieldDistributor']) {
       const disc = accountDiscriminator(name);
       expect(disc.length).toBe(8);
+    }
+  });
+
+  it('verifies no account discriminator collisions within each program', () => {
+    const idlFiles = listArealIdls();
+    if (idlFiles.length === 0) return;
+
+    for (const file of idlFiles) {
+      const raw = readFileSync(file, 'utf8');
+      const idl = parseIdlJson(raw);
+      const seen = new Map<string, string>();
+
+      for (const account of idl.accounts) {
+        const disc = accountDiscriminator(account.name);
+        const hex = disc.toString('hex');
+        const existing = seen.get(hex);
+        expect(existing).toBeUndefined(
+          `Account discriminator collision in ${path.basename(file)}: ` +
+          `"${account.name}" and "${existing}" both map to 0x${hex}`
+        );
+        seen.set(hex, account.name);
+      }
+    }
+  });
+
+  it('verifies no instruction discriminator collisions within each program', () => {
+    const idlFiles = listArealIdls();
+    if (idlFiles.length === 0) return;
+
+    for (const file of idlFiles) {
+      const raw = readFileSync(file, 'utf8');
+      const idl = parseIdlJson(raw);
+      const seen = new Map<string, string>();
+
+      for (const ix of idl.instructions) {
+        const disc = instructionDiscriminator(ix.name);
+        const hex = disc.toString('hex');
+        const existing = seen.get(hex);
+        expect(existing).toBeUndefined(
+          `Instruction discriminator collision in ${path.basename(file)}: ` +
+          `"${ix.name}" and "${existing}" both map to 0x${hex}`
+        );
+        seen.set(hex, ix.name);
+      }
     }
   });
 });
