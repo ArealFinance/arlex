@@ -72,7 +72,7 @@ function isNormalized(v: unknown): v is NormalizedIdl {
 
 export { parseIdl, parseIdlJson, IdlParseError } from './parser';
 export type { NormalizedIdl } from './parser';
-export { snakeToCamel, pascalCase, sanitizeIdent, camelField, pascalType } from './naming';
+export { snakeToCamel, pascalCase, sanitizeIdent, camelField, pascalType, safeConstName, UnsafeIdentError } from './naming';
 export { classifyBytesField, lookupOverride } from './pubkey-detection';
 export type { PubkeyOverrides, PubkeyClassification } from './pubkey-detection';
 export { mapIdlType, mapEnumVariants, UnsupportedTypeError } from './type-mapper';

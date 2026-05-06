@@ -13,7 +13,7 @@
  *   - An IDL field-list constant for downstream encode/decode.
  */
 import type { IdlAccountDef, IdlField, IdlType, IdlTypeDef } from '../types';
-import { camelField, pascalType } from './naming';
+import { camelField, pascalType, safeConstName } from './naming';
 import { mapIdlType, mapEnumVariants, UnsupportedTypeError } from './type-mapper';
 import { accountDiscriminator } from '../discriminator';
 import type { PubkeyOverrides } from './pubkey-detection';
@@ -87,7 +87,7 @@ function nestedMapsLiteral(fields: IdlField[], registry: Map<string, IdlTypeDef>
     if (inner && 'defined' in inner) {
       const def = registry.get(inner.defined);
       if (def && def.type.kind === 'struct') {
-        const mapName = `WIRE_${def.name.toUpperCase()}_FIELDS`;
+        const mapName = `WIRE_${safeConstName(def.name)}_FIELDS`;
         if (isArray) arrayEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
         else nestedEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
       }
@@ -124,10 +124,11 @@ function emitDefinedStruct(name: string, fields: IdlField[], ctx: EmitContext, l
   }
   lines.push(`}`);
   lines.push('');
-  lines.push(`export const WIRE_${name.toUpperCase()}_FIELDS: WireFieldMap = ${wireMapLiteral(fields)};`);
+  const constStem = safeConstName(name);
+  lines.push(`export const WIRE_${constStem}_FIELDS: WireFieldMap = ${wireMapLiteral(fields)};`);
   lines.push('');
   lines.push(`/** Raw IDL field shape for ${name} — used by the runtime serializer. */`);
-  lines.push(`export const IDL_${name.toUpperCase()}_FIELDS: IdlField[] = ${fieldListLiteral(fields)};`);
+  lines.push(`export const IDL_${constStem}_FIELDS: IdlField[] = ${fieldListLiteral(fields)};`);
   lines.push('');
 }
 
@@ -218,12 +219,7 @@ export function emitAccountsSource(idl: NormalizedIdl, options: EmitAccountsOpti
 
   // Accounts.
   for (const acc of idl.accounts) {
-    let tsName: string;
-    try {
-      tsName = pascalType(acc.name);
-    } catch (e) {
-      throw e;
-    }
+    const tsName = pascalType(acc.name);
 
     lines.push(`// ============================================================`);
     lines.push(`// Account: ${acc.name}`);
@@ -252,13 +248,16 @@ export function emitAccountsSource(idl: NormalizedIdl, options: EmitAccountsOpti
     lines.push('');
 
     const disc = accountDiscriminator(acc.name);
-    lines.push(`export const ${acc.name.toUpperCase()}_DISCRIMINATOR: Uint8Array = ${toUint8ArrayLiteral(disc)};`);
+    // Validated identifier stem — `safeConstName` throws if `acc.name` contains
+    // any character that could break out of the constant-name context.
+    const constStem = safeConstName(acc.name);
+    lines.push(`export const ${constStem}_DISCRIMINATOR: Uint8Array = ${toUint8ArrayLiteral(disc)};`);
     lines.push('');
 
-    lines.push(`export const WIRE_${acc.name.toUpperCase()}_FIELDS: WireFieldMap = ${wireMapLiteral(acc.type.fields)};`);
+    lines.push(`export const WIRE_${constStem}_FIELDS: WireFieldMap = ${wireMapLiteral(acc.type.fields)};`);
     lines.push('');
 
-    lines.push(`const IDL_${acc.name.toUpperCase()}_FIELDS: IdlField[] = ${fieldListLiteral(acc.type.fields)};`);
+    lines.push(`const IDL_${constStem}_FIELDS: IdlField[] = ${fieldListLiteral(acc.type.fields)};`);
     lines.push('');
 
     const { nested, arrays } = nestedMapsLiteral(acc.type.fields, idl.definedRegistry);
@@ -268,9 +267,9 @@ export function emitAccountsSource(idl: NormalizedIdl, options: EmitAccountsOpti
     lines.push(` */`);
     lines.push(`export function parse${tsName}(data: Buffer | Uint8Array): ${tsName} {`);
     lines.push(`  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);`);
-    lines.push(`  parseDiscriminator(buf, ${acc.name.toUpperCase()}_DISCRIMINATOR, '${tsName}');`);
-    lines.push(`  const raw = deserializeAccount(IDL_${acc.name.toUpperCase()}_FIELDS, buf, TYPE_REGISTRY);`);
-    lines.push(`  return remapWireToTs(raw, WIRE_${acc.name.toUpperCase()}_FIELDS, {`);
+    lines.push(`  parseDiscriminator(buf, ${constStem}_DISCRIMINATOR, ${JSON.stringify(tsName)});`);
+    lines.push(`  const raw = deserializeAccount(IDL_${constStem}_FIELDS, buf, TYPE_REGISTRY);`);
+    lines.push(`  return remapWireToTs(raw, WIRE_${constStem}_FIELDS, {`);
     lines.push(`    nestedMaps: ${nested},`);
     lines.push(`    arrayMaps: ${arrays},`);
     lines.push(`  }) as unknown as ${tsName};`);

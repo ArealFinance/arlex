@@ -13,7 +13,7 @@
  * and IDL field-list constants.
  */
 import type { IdlField, IdlInstruction, IdlType, IdlTypeDef } from '../types';
-import { camelField, pascalType } from './naming';
+import { camelField, pascalType, safeConstName } from './naming';
 import { mapIdlType, mapEnumVariants, UnsupportedTypeError } from './type-mapper';
 import { instructionDiscriminator } from '../discriminator';
 import type { PubkeyOverrides } from './pubkey-detection';
@@ -66,7 +66,7 @@ function nestedMapsLiteral(fields: IdlField[], registry: Map<string, IdlTypeDef>
     if (inner && 'defined' in inner) {
       const def = registry.get(inner.defined);
       if (def && def.type.kind === 'struct') {
-        const mapName = `WIRE_${def.name.toUpperCase()}_FIELDS`;
+        const mapName = `WIRE_${safeConstName(def.name)}_FIELDS`;
         if (isArray) arrayEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
         else nestedEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
       }
@@ -118,10 +118,11 @@ function emitDefinedStruct(name: string, fields: IdlField[], ctx: EmitContext, l
   }
   lines.push(`}`);
   lines.push('');
-  lines.push(`export const WIRE_${name.toUpperCase()}_FIELDS: WireFieldMap = ${wireMapLiteral(fields)};`);
+  const constStem = safeConstName(name);
+  lines.push(`export const WIRE_${constStem}_FIELDS: WireFieldMap = ${wireMapLiteral(fields)};`);
   lines.push('');
   lines.push(`/** Raw IDL field shape for ${name} — used by the runtime serializer. */`);
-  lines.push(`export const IDL_${name.toUpperCase()}_FIELDS: IdlField[] = ${fieldListLiteral(fields)};`);
+  lines.push(`export const IDL_${constStem}_FIELDS: IdlField[] = ${fieldListLiteral(fields)};`);
   lines.push('');
 }
 
@@ -207,6 +208,9 @@ export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstruct
 
   for (const ix of idl.instructions) {
     const tsName = pascalType(ix.name);
+    // Validated identifier stem — `safeConstName` throws if `ix.name` contains
+    // any character that could break out of an identifier / comment context.
+    const constStem = safeConstName(ix.name);
 
     lines.push(`// ============================================================`);
     lines.push(`// Instruction: ${ix.name}`);
@@ -214,7 +218,7 @@ export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstruct
     lines.push('');
 
     const disc = instructionDiscriminator(ix.name);
-    lines.push(`export const ${ix.name.toUpperCase()}_DISCRIMINATOR: Uint8Array = ${toUint8ArrayLiteral(disc)};`);
+    lines.push(`export const ${constStem}_DISCRIMINATOR: Uint8Array = ${toUint8ArrayLiteral(disc)};`);
     lines.push('');
 
     // Accounts interface
@@ -253,9 +257,9 @@ export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstruct
       lines.push(`}`);
       lines.push('');
 
-      lines.push(`const IDL_${ix.name.toUpperCase()}_ARG_FIELDS: IdlField[] = ${fieldListLiteral(ix.args)};`);
+      lines.push(`const IDL_${constStem}_ARG_FIELDS: IdlField[] = ${fieldListLiteral(ix.args)};`);
       lines.push('');
-      lines.push(`export const WIRE_${ix.name.toUpperCase()}_ARG_FIELDS: WireFieldMap = ${wireMapLiteral(ix.args)};`);
+      lines.push(`export const WIRE_${constStem}_ARG_FIELDS: WireFieldMap = ${wireMapLiteral(ix.args)};`);
       lines.push('');
 
       const { nested, arrays } = nestedMapsLiteral(ix.args, idl.definedRegistry);
@@ -264,18 +268,18 @@ export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstruct
       lines.push(` * Returns a Buffer with discriminator + serialized args.`);
       lines.push(` */`);
       lines.push(`export function encode${tsName}Args(args: ${tsName}Args): Buffer {`);
-      lines.push(`  const wire = remapTsToWire(args as unknown as Record<string, unknown>, WIRE_${ix.name.toUpperCase()}_ARG_FIELDS, {`);
+      lines.push(`  const wire = remapTsToWire(args as unknown as Record<string, unknown>, WIRE_${constStem}_ARG_FIELDS, {`);
       lines.push(`    nestedMaps: ${nested},`);
       lines.push(`    arrayMaps: ${arrays},`);
       lines.push(`  });`);
-      lines.push(`  const argBuf = serializeArgs(IDL_${ix.name.toUpperCase()}_ARG_FIELDS, wire, TYPE_REGISTRY);`);
-      lines.push(`  return Buffer.concat([Buffer.from(${ix.name.toUpperCase()}_DISCRIMINATOR), argBuf]);`);
+      lines.push(`  const argBuf = serializeArgs(IDL_${constStem}_ARG_FIELDS, wire, TYPE_REGISTRY);`);
+      lines.push(`  return Buffer.concat([Buffer.from(${constStem}_DISCRIMINATOR), argBuf]);`);
       lines.push(`}`);
       lines.push('');
     } else {
       lines.push(`/** Encode (no args) for the \`${ix.name}\` instruction — discriminator only. */`);
       lines.push(`export function encode${tsName}Args(): Buffer {`);
-      lines.push(`  return Buffer.from(${ix.name.toUpperCase()}_DISCRIMINATOR);`);
+      lines.push(`  return Buffer.from(${constStem}_DISCRIMINATOR);`);
       lines.push(`}`);
       lines.push('');
     }

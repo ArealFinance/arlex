@@ -55,6 +55,44 @@ function assertIsString(value: unknown, where: string): asserts value is string 
   }
 }
 
+/**
+ * Identifier safety regex — same shape as the one in `naming.ts`. Defined
+ * locally to avoid coupling the parser to the naming module.
+ *
+ * SECURITY (CRIT-1, CRIT-2, CRIT-4): every IDL field that ends up
+ * interpolated into emitted TS source as an identifier MUST pass this gate.
+ * Names that fail are rejected at parse time with a path-bearing error so
+ * malicious IDLs are surfaced before any code is emitted.
+ */
+const IDL_SAFE_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+function assertSafeIdent(value: string, where: string): void {
+  if (!IDL_SAFE_IDENT_RE.test(value)) {
+    throw new IdlParseError(
+      `${where} is not a safe identifier: ${JSON.stringify(value)} ` +
+      `(must match /^[A-Za-z_$][A-Za-z0-9_$]*$/)`,
+    );
+  }
+}
+
+/**
+ * Banner-string safety regex — IDL `name` and `version` end up in a
+ * single-line `//` banner comment. We accept word chars, dot, hyphen, plus,
+ * and space; anything else (notably newlines, quotes, `*`, `/`) is rejected
+ * so an attacker cannot terminate the comment and inject top-level
+ * statements (CRIT-3).
+ */
+const IDL_SAFE_BANNER_RE = /^[\w.\-+ ]+$/;
+
+function assertSafeBannerString(value: string, where: string): void {
+  if (!IDL_SAFE_BANNER_RE.test(value)) {
+    throw new IdlParseError(
+      `${where} contains characters not permitted in the banner: ` +
+      `${JSON.stringify(value)} (allowed: alphanumerics, '.', '-', '+', space)`,
+    );
+  }
+}
+
 function validateIdlType(type: unknown, where: string): IdlType {
   if (typeof type === 'string') return type as IdlType;
   if (type !== null && typeof type === 'object' && !Array.isArray(type)) {
@@ -74,6 +112,7 @@ function validateIdlType(type: unknown, where: string): IdlType {
     }
     if ('defined' in obj) {
       assertIsString(obj.defined, `${where}.defined`);
+      assertSafeIdent(obj.defined, `${where}.defined`);
       return { defined: obj.defined } as IdlType;
     }
   }
@@ -83,12 +122,14 @@ function validateIdlType(type: unknown, where: string): IdlType {
 function validateField(field: unknown, where: string): IdlField {
   assertIsObject(field, where);
   assertIsString(field.name, `${where}.name`);
+  assertSafeIdent(field.name, `${where}.name`);
   return { name: field.name, type: validateIdlType(field.type, `${where}.type`) };
 }
 
 function validateInstruction(ix: unknown, where: string): IdlInstruction {
   assertIsObject(ix, where);
   assertIsString(ix.name, `${where}.name`);
+  assertSafeIdent(ix.name, `${where}.name`);
   assertIsArray(ix.accounts, `${where}.accounts`);
   assertIsArray(ix.args, `${where}.args`);
   return {
@@ -96,6 +137,7 @@ function validateInstruction(ix: unknown, where: string): IdlInstruction {
     accounts: ix.accounts.map((a, i) => {
       assertIsObject(a, `${where}.accounts[${i}]`);
       assertIsString(a.name, `${where}.accounts[${i}].name`);
+      assertSafeIdent(a.name, `${where}.accounts[${i}].name`);
       return {
         name: a.name,
         isMut: Boolean(a.isMut),
@@ -109,6 +151,7 @@ function validateInstruction(ix: unknown, where: string): IdlInstruction {
 function validateAccountDef(acc: unknown, where: string): IdlAccountDef {
   assertIsObject(acc, where);
   assertIsString(acc.name, `${where}.name`);
+  assertSafeIdent(acc.name, `${where}.name`);
   assertIsObject(acc.type, `${where}.type`);
   assertIsString(acc.type.kind, `${where}.type.kind`);
   if (acc.type.kind !== 'struct') {
@@ -127,6 +170,7 @@ function validateAccountDef(acc: unknown, where: string): IdlAccountDef {
 function validateTypeDef(td: unknown, where: string): IdlTypeDef {
   assertIsObject(td, where);
   assertIsString(td.name, `${where}.name`);
+  assertSafeIdent(td.name, `${where}.name`);
   assertIsObject(td.type, `${where}.type`);
   assertIsString(td.type.kind, `${where}.type.kind`);
   const kind = td.type.kind;
@@ -145,6 +189,7 @@ function validateTypeDef(td: unknown, where: string): IdlTypeDef {
     const variants = td.type.variants.map((v, i) => {
       assertIsObject(v, `${where}.type.variants[${i}]`);
       assertIsString(v.name, `${where}.type.variants[${i}].name`);
+      assertSafeIdent(v.name, `${where}.type.variants[${i}].name`);
       // Note: enum-with-data is intentionally NOT rejected here — the type-mapper
       // is the one that throws on first encounter. This keeps the parser pure.
       return { name: v.name };
@@ -157,6 +202,7 @@ function validateTypeDef(td: unknown, where: string): IdlTypeDef {
 function validateEvent(ev: unknown, where: string): IdlEvent {
   assertIsObject(ev, where);
   assertIsString(ev.name, `${where}.name`);
+  assertSafeIdent(ev.name, `${where}.name`);
   assertIsArray(ev.fields, `${where}.fields`);
   return {
     name: ev.name,
@@ -170,6 +216,7 @@ function validateError(err: unknown, where: string): IdlError {
     throw new IdlParseError(`${where}.code must be a number`);
   }
   assertIsString(err.name, `${where}.name`);
+  assertSafeIdent(err.name, `${where}.name`);
   assertIsString(err.msg, `${where}.msg`);
   return { code: err.code, name: err.name, msg: err.msg };
 }
@@ -185,6 +232,10 @@ export function parseIdl(raw: unknown): NormalizedIdl {
   assertIsObject(raw, 'idl');
   assertIsString(raw.version, 'idl.version');
   assertIsString(raw.name, 'idl.name');
+  // Both fields land in the banner comment of every emitted file; reject any
+  // characters that could break out of the `//` context (CRIT-3).
+  assertSafeBannerString(raw.version, 'idl.version');
+  assertSafeBannerString(raw.name, 'idl.name');
 
   const instructionsRaw = raw.instructions ?? [];
   const accountsRaw = raw.accounts ?? [];

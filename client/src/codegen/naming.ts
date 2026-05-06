@@ -5,7 +5,27 @@
  * The TS surface uses camelCase for fields and PascalCase for types.
  * `sanitizeIdent` guards against TS reserved words and identifiers
  * starting with digits.
+ *
+ * SECURITY: identifiers from IDL inputs are interpolated into emitted TS
+ * source. To prevent code injection (CRIT-1, CRIT-4), `sanitizeIdent` is
+ * the canonical chokepoint and THROWS `UnsafeIdentError` on any input that
+ * contains characters outside the safe identifier alphabet. All emitters
+ * MUST funnel raw IDL names through `sanitizeIdent` (directly or via
+ * `camelField` / `pascalType` / `safeConstName`) before interpolation.
  */
+
+/** Identifier safety regex: matches a single legal TS/JS identifier. */
+const SAFE_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/** Thrown by `sanitizeIdent` when input contains characters that could
+ *  break out of an identifier context in emitted source. */
+export class UnsafeIdentError extends Error {
+  constructor(name: string, hint?: string) {
+    const detail = hint ? ` (${hint})` : '';
+    super(`unsafe identifier from IDL: ${JSON.stringify(name)}${detail}`);
+    this.name = 'UnsafeIdentError';
+  }
+}
 
 const TS_RESERVED = new Set([
   'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger', 'default',
@@ -70,15 +90,22 @@ export function pascalCase(input: string): string {
 /**
  * Make an identifier safe for use as a TS variable / property name.
  *
- * - Prefixes a `_` if the name starts with a digit.
- * - Suffixes a `_` if the name collides with a TS reserved word.
+ * Contract:
+ * - Prefixes `_` if the name starts with a digit.
+ * - Suffixes `_` if the name collides with a TS reserved word.
  * - Returns `_` if the input is empty.
+ * - **Throws `UnsafeIdentError`** if the (post-prefix) string contains any
+ *   character outside `[A-Za-z0-9_$]`. This is the chokepoint that prevents
+ *   IDL-driven code injection into emitted TS source.
  */
 export function sanitizeIdent(name: string): string {
   if (!name) return '_';
   let safe = name;
   if (/^[0-9]/.test(safe)) safe = `_${safe}`;
   if (TS_RESERVED.has(safe)) safe = `${safe}_`;
+  if (!SAFE_IDENT_RE.test(safe)) {
+    throw new UnsafeIdentError(name, 'must match /^[A-Za-z_$][A-Za-z0-9_$]*$/');
+  }
   return safe;
 }
 
@@ -90,4 +117,23 @@ export function camelField(name: string): string {
 /** Combined helper: snake_case / pascal name -> safe PascalCase TS type name. */
 export function pascalType(name: string): string {
   return sanitizeIdent(pascalCase(name));
+}
+
+/**
+ * Build a SCREAMING_SNAKE constant-name fragment from a raw IDL name.
+ *
+ * Validates that the raw input is itself a safe identifier (per the same
+ * rules `sanitizeIdent` enforces) and then uppercases it. Used for
+ * `*_DISCRIMINATOR`, `WIRE_*_FIELDS`, `IDL_*_FIELDS` etc. so that emitters
+ * cannot interpolate attacker-controlled punctuation through a raw
+ * `.toUpperCase()` on `acc.name` / `ix.name`.
+ *
+ * Preserves snake_case (snake_case -> SNAKE_CASE) so existing generated
+ * output for snake_case-named instructions is byte-identical.
+ */
+export function safeConstName(name: string): string {
+  // sanitizeIdent throws if `name` is not a legal identifier — exactly the
+  // guarantee we need before any raw uppercase interpolation.
+  sanitizeIdent(name);
+  return name.toUpperCase();
 }

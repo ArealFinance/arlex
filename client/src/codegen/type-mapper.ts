@@ -6,7 +6,7 @@
  */
 import type { IdlType, IdlTypeDef } from '../types';
 import { classifyBytesField, lookupOverride, type PubkeyOverrides } from './pubkey-detection';
-import { pascalType } from './naming';
+import { pascalType, sanitizeIdent } from './naming';
 
 export class UnsupportedTypeError extends Error {
   constructor(message: string) {
@@ -127,5 +127,15 @@ export function mapEnumVariants(def: IdlTypeDef): string {
     throw new UnsupportedTypeError(`enum '${def.name}' has data-bearing variants (not supported in Phase 2)`);
   }
   if (variants.length === 0) return 'never';
-  return variants.map(v => `'${v.name}'`).join(' | ');
+  // SECURITY (CRIT-2 defense-in-depth): validate each variant name as a safe
+  // identifier before interpolating into the single-quoted string-literal
+  // union. Parser-level validation should already have rejected unsafe
+  // names, but enforcing here too means this helper is safe to call on any
+  // IdlTypeDef regardless of provenance.
+  return variants
+    .map(v => {
+      sanitizeIdent(v.name); // throws UnsafeIdentError on bad input
+      return `'${v.name}'`;
+    })
+    .join(' | ');
 }

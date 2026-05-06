@@ -19,15 +19,34 @@ export interface BannerInput {
 }
 
 /**
+ * Sanitize a string for safe interpolation into a single-line `//` comment.
+ *
+ * Strips CR/LF (which would terminate the comment and let attacker-controlled
+ * IDL `name` / `version` inject top-level statements — CRIT-3) and replaces
+ * the C-style block-comment terminator `* /` with a visually-similar but
+ * inert form so banners can never accidentally close an enclosing block
+ * comment either.
+ */
+function sanitizeBannerText(s: string): string {
+  return s.replace(/[\r\n]+/g, ' ').replace(/\*\//g, '*\\/');
+}
+
+/**
  * Build the standard "DO NOT EDIT" banner.
  *
  * Intentionally NO timestamp — output must be deterministic so that
  * regenerating against the same IDL produces byte-identical files.
+ *
+ * SECURITY: `idlName` and `idlVersion` come from attacker-controllable IDL
+ * input. They are sanitized here as a last-line defense (parser-level
+ * validation in `parser.ts` is the primary gate).
  */
 export function buildBanner(input: BannerInput): string {
+  const safeName = sanitizeBannerText(input.idlName);
+  const safeVersion = sanitizeBannerText(input.idlVersion);
   return [
     '// AUTO-GENERATED — DO NOT EDIT',
-    `// IDL: ${input.idlName} v${input.idlVersion}`,
+    `// IDL: ${safeName} v${safeVersion}`,
     `// Generator: @arlex/client codegen v${GENERATOR_VERSION}`,
     '',
     '',
