@@ -1,0 +1,47 @@
+{
+  "version": "0.1.0",
+  "name": "minimal",
+  "metadata": {
+    "address": "11111111111111111111111111111111"
+  },
+  "instructions": [
+    {
+      "name": "initialize",
+      "accounts": [
+        { "name": "config", "isMut": true, "isSigner": false },
+        { "name": "payer", "isMut": true, "isSigner": true },
+        { "name": "system_program", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "amount", "type": "u64" },
+        { "name": "authority", "type": { "array": ["u8", 32] } }
+      ]
+    },
+    {
+      "name": "noop",
+      "accounts": [
+        { "name": "signer", "isMut": false, "isSigner": true }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "ConfigAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "authority", "type": { "array": ["u8", 32] } },
+          { "name": "params_hash", "type": { "array": ["u8", 32] } },
+          { "name": "amount", "type": "u64" },
+          { "name": "is_active", "type": "bool" },
+          { "name": "bump", "type": "u8" }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    { "code": 6000, "name": "InvalidAuthority", "msg": "The provided authority is not valid" },
+    { "code": 6001, "name": "AlreadyInitialized", "msg": "Config already initialized" }
+  ]
+}
