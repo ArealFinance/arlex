@@ -34,6 +34,11 @@ describe('emitInstructionsSource — minimal IDL', () => {
     expect(src).toContain('INITIALIZE_DISCRIMINATOR');
     expect(src).toContain('NOOP_DISCRIMINATOR');
   });
+  it('emits explicit Buffer import for browser-bundle compatibility (G3 follow-up)', () => {
+    // Required for Vite/Rollup which do NOT auto-polyfill the global Buffer.
+    // Generated encode*Args helpers use Buffer.from / Buffer.concat below.
+    expect(src).toContain("import { Buffer } from 'buffer';");
+  });
 });
 
 describe('emitInstructionsSource — mixed IDL', () => {

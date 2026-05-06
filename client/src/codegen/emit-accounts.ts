@@ -178,6 +178,12 @@ export function emitAccountsSource(idl: NormalizedIdl, options: EmitAccountsOpti
   };
   const lines: string[] = [];
 
+  // Explicit Buffer import — required for browser bundlers (Vite/Rollup) which
+  // do NOT auto-polyfill the global `Buffer`. Generated parsers below use
+  // `Buffer.isBuffer` / `Buffer.from`, so consumers building for the browser
+  // need this `import { Buffer } from 'buffer'` to resolve to a polyfill.
+  lines.push(`import { Buffer } from 'buffer';`, '');
+
   lines.push(
     `import {`,
     `  PublicKey,`,
