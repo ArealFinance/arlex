@@ -33,6 +33,11 @@ describe('emitAccountsSource — minimal IDL', () => {
   it('imports from @arlex/client/codegen-runtime', () => {
     expect(src).toContain("from '@arlex/client/codegen-runtime'");
   });
+  it('emits explicit Buffer import for browser-bundle compatibility (G3 follow-up)', () => {
+    // Required for Vite/Rollup which do NOT auto-polyfill the global Buffer.
+    // Generated parsers use Buffer.isBuffer / Buffer.from below.
+    expect(src).toContain("import { Buffer } from 'buffer';");
+  });
 });
 
 describe('emitAccountsSource — mixed IDL with defined types', () => {
