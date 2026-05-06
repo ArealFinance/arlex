@@ -21,14 +21,16 @@ export interface BannerInput {
 /**
  * Sanitize a string for safe interpolation into a single-line `//` comment.
  *
- * Strips CR/LF (which would terminate the comment and let attacker-controlled
- * IDL `name` / `version` inject top-level statements — CRIT-3) and replaces
- * the C-style block-comment terminator `* /` with a visually-similar but
- * inert form so banners can never accidentally close an enclosing block
- * comment either.
+ * Strips ALL ECMAScript LineTerminator code points (CR, LF, U+2028 LINE
+ * SEPARATOR, U+2029 PARAGRAPH SEPARATOR) which would terminate the `//`
+ * comment and let attacker-controlled banner text (IDL `name` / `version`
+ * — CRIT-3 — or operator-supplied `--program-name` — FINDING-1) inject
+ * top-level statements. Also replaces the C-style block-comment terminator
+ * `* /` with an inert form so banners can never accidentally close an
+ * enclosing block comment either.
  */
 function sanitizeBannerText(s: string): string {
-  return s.replace(/[\r\n]+/g, ' ').replace(/\*\//g, '*\\/');
+  return s.replace(/[\r\n\u2028\u2029]+/g, ' ').replace(/\*\//g, '*\\/');
 }
 
 /**

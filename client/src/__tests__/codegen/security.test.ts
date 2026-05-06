@@ -11,7 +11,7 @@
  *   WARN-2  malformed --pubkey-overrides JSON
  */
 import { describe, it, expect } from 'vitest';
-import { parseIdl, generateTypes, IdlParseError, UnsafeIdentError, sanitizeIdent } from '../../codegen';
+import { parseIdl, generateTypes, IdlParseError, UnsafeIdentError, sanitizeIdent, buildBanner } from '../../codegen';
 
 // Minimal scaffold that all malicious-IDL tests start from.
 function baseIdl(): Record<string, unknown> {
@@ -162,6 +162,52 @@ describe('codegen security — banner injection (CRIT-3)', () => {
     idl.version = '0.1.0-rc.1+build.42';
     idl.name = 'good-name.0';
     expect(() => parseIdl(idl)).not.toThrow();
+  });
+
+  it('writer.sanitizeBannerText strips U+2028 and U+2029 (FINDING-1)', () => {
+    // ECMAScript LineTerminator includes U+2028 (LINE SEPARATOR) and U+2029
+    // (PARAGRAPH SEPARATOR) — they terminate `// SingleLineComment`. The
+    // operator-supplied `--program-name` flag bypasses parser-level banner
+    // validation (which only gates IDL `name` / `version`), so the writer's
+    // own sanitizer must defend against these code points.
+    const LS = ' ';
+    const PS = ' ';
+    const malicious = `evil${LS}export const PWN_LS = 1; /*`;
+    const maliciousPS = `evil${PS}export const PWN_PS = 1; /*`;
+
+    const bannerLS = buildBanner({ idlName: malicious, idlVersion: '0.1.0' });
+    const bannerPS = buildBanner({ idlName: maliciousPS, idlVersion: '0.1.0' });
+
+    // The dangerous code points must not appear verbatim in the banner.
+    expect(bannerLS).not.toContain(LS);
+    expect(bannerLS).not.toContain(PS);
+    expect(bannerPS).not.toContain(LS);
+    expect(bannerPS).not.toContain(PS);
+
+    // Banner must remain a 3-line `//` comment block (plus trailing blank
+    // lines from buildBanner) — the injected `export` payload must stay
+    // inside the IDL-name comment, not become a top-level statement.
+    expect(bannerLS.split('\n').filter((l) => l.startsWith('//'))).toHaveLength(3);
+    expect(bannerPS.split('\n').filter((l) => l.startsWith('//'))).toHaveLength(3);
+
+    // End-to-end: feeding the same payload through generateTypes via
+    // --program-name must produce sources where the injection is contained
+    // inside the banner comment, not eligible for top-level evaluation.
+    const idl = baseIdl();
+    idl.accounts = [{ name: 'Acc', type: { kind: 'struct', fields: [] } }];
+    const out = generateTypes(idl, { programName: malicious });
+    for (const src of [out.accounts, out.instructions, out.errors]) {
+      expect(src).not.toContain(LS);
+      expect(src).not.toContain(PS);
+      // The injected `export const PWN_LS` payload, if present, must be on
+      // the same banner line as the `//` prefix — i.e. never start a line.
+      const lines = src.split('\n');
+      for (const line of lines) {
+        if (line.includes('PWN_LS')) {
+          expect(line.trimStart().startsWith('//')).toBe(true);
+        }
+      }
+    }
   });
 });
 
