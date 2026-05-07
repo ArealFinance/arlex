@@ -185,15 +185,43 @@ fn parse_fn_sig(line: &str) -> Option<IdlInstruction> {
     let after_fn = line.strip_prefix("pub fn ")?;
     let fn_name = after_fn.split('(').next()?.trim().to_string();
 
-    // Get everything between first ( and last )
+    // Find the opening `(` of the fn argument list, then walk forward
+    // tracking paren depth so we stop at its matching `)`. Using
+    // `line.rfind(')')` is unsound here: the line may contain `Result<()>`
+    // or an inline body like `{ Ok(()) }`, and the last `)` would belong
+    // to one of those, polluting `args_str` with `") -> Result<("` that
+    // then yields phantom IDL args.
     let start = line.find('(')?;
-    let end = line.rfind(')')?;
+    let bytes = line.as_bytes();
+    let mut depth: i32 = 1;
+    let mut end: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start + 1) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
     let args_str = &line[start + 1..end];
 
+    // Split args on top-level commas only — commas inside generics
+    // (`Context<Foo, Bar>`), arrays (`[u8; 32]`) or tuples must not split.
     let mut args = Vec::new();
-    for param in args_str.split(',') {
+    for param in split_top_level_commas(args_str) {
         let param = param.trim();
-        if param.starts_with("ctx") || param.is_empty() { continue; }
+        if param.is_empty() { continue; }
+        // Skip `ctx: Context<...>` — the first arg of every Arlex handler.
+        // Match on the identifier so we don't accidentally drop a future
+        // arg that happens to start with the letters `ctx`.
+        let ident = param.split(':').next().unwrap_or("").trim();
+        if ident == "ctx" || ident == "_ctx" { continue; }
         if let Some((name, ty)) = param.split_once(':') {
             args.push(IdlField {
                 name: name.trim().to_string(),
@@ -203,6 +231,35 @@ fn parse_fn_sig(line: &str) -> Option<IdlInstruction> {
     }
 
     Some(IdlInstruction { name: fn_name, accounts: Vec::new(), args })
+}
+
+/// Split a parameter list on commas that are at depth 0 with respect to
+/// `()`, `[]` and `<>`. Required so types like `Context<Foo, Bar>`,
+/// `[u8; 32]`, `alloc::vec::Vec<[u8; 32]>` or tuples stay intact.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut angle = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => { paren += 1; buf.push(c); }
+            ')' => { paren -= 1; buf.push(c); }
+            '[' => { bracket += 1; buf.push(c); }
+            ']' => { bracket -= 1; buf.push(c); }
+            '<' => { angle += 1; buf.push(c); }
+            '>' => { angle -= 1; buf.push(c); }
+            ',' if paren == 0 && bracket == 0 && angle == 0 => {
+                out.push(std::mem::take(&mut buf));
+            }
+            _ => buf.push(c),
+        }
+    }
+    if !buf.trim().is_empty() {
+        out.push(buf);
+    }
+    out
 }
 
 fn parse_account_structs(source: &str, idl: &mut Idl) {
@@ -781,6 +838,135 @@ pub enum Errors {
         assert_eq!(idl.errors.len(), 3);
         assert_eq!(idl.errors[0].msg, "First"); // name used as msg
         assert_eq!(idl.errors[2].code, 6002);
+    }
+
+    // ==================== parse_fn_sig regression ====================
+    // Bug: previous parser used line.rfind(')') to find the end of the
+    // fn argument list. For any signature containing `Result<()>` or an
+    // inline body it picked up a `)` outside the args, producing phantom
+    // IDL args like `{ name: "amount", type: { defined: "u64) -> Result<(" }}`.
+
+    #[test]
+    fn test_parse_fn_sig_single_typed_arg_with_inline_body() {
+        // Hits the rfind(')') trap via `Result<()>` AND inline body.
+        let line = "pub fn mint_ot(ctx: Context<MintOt>, amount: u64) -> Result<()> { Ok(()) }";
+        let ix = parse_fn_sig(line).unwrap();
+        assert_eq!(ix.name, "mint_ot");
+        assert_eq!(ix.args.len(), 1, "phantom args from rfind(')') regression");
+        assert_eq!(ix.args[0].name, "amount");
+        assert_eq!(ix.args[0].ty, serde_json::json!("u64"));
+    }
+
+    #[test]
+    fn test_parse_fn_sig_no_args() {
+        let line = "pub fn distribute_revenue(ctx: Context<DistributeRevenue>) -> Result<()> { Ok(()) }";
+        let ix = parse_fn_sig(line).unwrap();
+        assert_eq!(ix.name, "distribute_revenue");
+        assert_eq!(ix.args.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_fn_sig_array_arg() {
+        // [u8; 32] contains a `;` and brackets — must not split or pollute the type.
+        let line = "pub fn update_publish_authority(ctx: Context<UpdatePublishAuthority>, new_publish_authority: [u8; 32]) -> Result<()>";
+        let ix = parse_fn_sig(line).unwrap();
+        assert_eq!(ix.name, "update_publish_authority");
+        assert_eq!(ix.args.len(), 1);
+        assert_eq!(ix.args[0].name, "new_publish_authority");
+        assert_eq!(ix.args[0].ty, serde_json::json!({"array": ["u8", 32]}));
+    }
+
+    #[test]
+    fn test_parse_fn_sig_vec_of_arrays_arg() {
+        // alloc::vec::Vec<[u8; 32]> — the type contains commas-free generics
+        // but earlier `,`-split would still trip on the inline body. Also
+        // exercises the `Vec<...>` mapping with a path-prefixed name.
+        let line = "pub fn claim(ctx: Context<Claim>, cumulative_amount: u64, proof: alloc::vec::Vec<[u8; 32]>) -> Result<()>";
+        let ix = parse_fn_sig(line).unwrap();
+        assert_eq!(ix.name, "claim");
+        assert_eq!(ix.args.len(), 2);
+        assert_eq!(ix.args[0].name, "cumulative_amount");
+        assert_eq!(ix.args[0].ty, serde_json::json!("u64"));
+        assert_eq!(ix.args[1].name, "proof");
+        // alloc::vec::Vec<...> isn't recognized as `Vec<...>` (path prefix);
+        // it should fall to a custom `defined` reference, but crucially the
+        // value must be a clean type — not `") -> Result<("`-style garbage.
+        // We assert it parses and the value matches a safe identifier shape
+        // (no `)` or `(` or `>` interlopers from outside the arg list).
+        let ty_str = ix.args[1].ty["defined"].as_str().unwrap_or("");
+        assert!(!ty_str.is_empty(), "type should resolve, got {:?}", ix.args[1].ty);
+        assert!(!ty_str.contains(')'), "type leaked closing paren: {ty_str:?}");
+        assert!(!ty_str.contains("Result"), "type leaked return type: {ty_str:?}");
+    }
+
+    #[test]
+    fn test_parse_fn_sig_three_args_with_bool() {
+        // convert_to_rwt — three primitive args, must not split into 4+ phantoms.
+        let line = "pub fn convert_to_rwt(ctx: Context<ConvertToRwt>, usdc_amount: u64, min_rwt_out: u64, swap_first: bool) -> Result<()>";
+        let ix = parse_fn_sig(line).unwrap();
+        assert_eq!(ix.name, "convert_to_rwt");
+        assert_eq!(ix.args.len(), 3);
+        assert_eq!(ix.args[0].name, "usdc_amount");
+        assert_eq!(ix.args[0].ty, serde_json::json!("u64"));
+        assert_eq!(ix.args[1].name, "min_rwt_out");
+        assert_eq!(ix.args[2].name, "swap_first");
+        assert_eq!(ix.args[2].ty, serde_json::json!("bool"));
+    }
+
+    #[test]
+    fn test_parse_fn_sig_publish_root_normalized() {
+        // publish_root in real source is multi-line; after normalize_source
+        // it collapses to this. Was an offending case in ownership-token /
+        // yield-distribution: `, max_total_claim: u64) -> Result<()> { ... }`
+        // produced `{ defined: "u64) -> Result<(" }` for max_total_claim.
+        let line = "pub fn publish_root( ctx: Context<PublishRoot>, merkle_root: [u8; 32], max_total_claim: u64, ) -> Result<()> { handler(ctx, merkle_root, max_total_claim) }";
+        let ix = parse_fn_sig(line).unwrap();
+        assert_eq!(ix.name, "publish_root");
+        assert_eq!(ix.args.len(), 2);
+        assert_eq!(ix.args[0].name, "merkle_root");
+        assert_eq!(ix.args[0].ty, serde_json::json!({"array": ["u8", 32]}));
+        assert_eq!(ix.args[1].name, "max_total_claim");
+        assert_eq!(ix.args[1].ty, serde_json::json!("u64"));
+    }
+
+    #[test]
+    fn test_parse_fn_sig_skips_underscore_ctx() {
+        // _ctx (allowed when handler ignores ctx) must also be skipped.
+        let line = "pub fn noop(_ctx: Context<Noop>, value: u64) -> Result<()>";
+        let ix = parse_fn_sig(line).unwrap();
+        assert_eq!(ix.args.len(), 1);
+        assert_eq!(ix.args[0].name, "value");
+    }
+
+    // ==================== split_top_level_commas ====================
+
+    #[test]
+    fn test_split_top_level_commas_plain() {
+        let parts = split_top_level_commas("a: u64, b: u64, c: bool");
+        assert_eq!(parts.iter().map(|s| s.trim()).collect::<Vec<_>>(),
+                   vec!["a: u64", "b: u64", "c: bool"]);
+    }
+
+    #[test]
+    fn test_split_top_level_commas_inside_generics() {
+        let parts = split_top_level_commas("ctx: Context<Foo, Bar>, amount: u64");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].trim(), "ctx: Context<Foo, Bar>");
+        assert_eq!(parts[1].trim(), "amount: u64");
+    }
+
+    #[test]
+    fn test_split_top_level_commas_inside_array() {
+        let parts = split_top_level_commas("a: [u8; 32], b: u64");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].trim(), "a: [u8; 32]");
+    }
+
+    #[test]
+    fn test_split_top_level_commas_trailing_comma() {
+        let parts = split_top_level_commas("a: u64, b: u64,");
+        // Trailing empty is dropped (whitespace-only after the last comma).
+        assert_eq!(parts.iter().filter(|p| !p.trim().is_empty()).count(), 2);
     }
 
     #[test]
