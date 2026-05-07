@@ -45,8 +45,18 @@ describe('emitInstructionsSource — mixed IDL', () => {
   const idl = parseIdlJson(fixture('mixed.idl.json'));
   const src = emitInstructionsSource(idl);
 
-  it('emits Entry struct (referenced from arg)', () => {
-    expect(src).toContain('export interface Entry {');
+  // Phase 3.5 C.2: defined struct interfaces are no longer inlined here.
+  // They live in defined-types.generated.ts and are imported.
+  it('imports Entry from defined-types.generated.js (referenced from arg)', () => {
+    expect(src).toContain("from './defined-types.generated.js';");
+    expect(src).toMatch(/import \{[\s\S]*Entry,[\s\S]*\} from '\.\/defined-types\.generated\.js';/);
+  });
+  it('does NOT inline Entry interface', () => {
+    expect(src).not.toContain('export interface Entry {');
+  });
+  it('does NOT inline TYPE_REGISTRY', () => {
+    expect(src).not.toContain('const TYPE_REGISTRY: TypeRegistry = buildTypeRegistry');
+    expect(src).toMatch(/import \{[\s\S]*TYPE_REGISTRY,[\s\S]*\} from '\.\/defined-types\.generated\.js';/);
   });
   it('correctly maps complex arg types', () => {
     expect(src).toContain('amount: bigint;');

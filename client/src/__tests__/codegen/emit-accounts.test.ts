@@ -44,16 +44,32 @@ describe('emitAccountsSource — mixed IDL with defined types', () => {
   const idl = parseIdlJson(fixture('mixed.idl.json'));
   const src = emitAccountsSource(idl);
 
-  it('emits the Entry struct interface BEFORE Vault that uses it', () => {
-    const entryIdx = src.indexOf('export interface Entry {');
-    const vaultIdx = src.indexOf('export interface Vault {');
-    expect(entryIdx).toBeGreaterThan(-1);
-    expect(vaultIdx).toBeGreaterThan(-1);
-    expect(entryIdx).toBeLessThan(vaultIdx);
+  // Phase 3.5 C.2: defined struct interfaces no longer live inline in
+  // accounts.generated.ts. They are imported from
+  // ./defined-types.generated.js. The emitter still references them by
+  // name (in account interface fields and in nested-map literals), so we
+  // verify the import + reference instead of the inline declaration.
+  it('imports Entry from defined-types.generated.js', () => {
+    expect(src).toContain("from './defined-types.generated.js';");
+    // Entry is a struct so its interface name + WIRE_ENTRY_FIELDS + IDL_ENTRY_FIELDS
+    // must all appear in the import block.
+    expect(src).toMatch(/import \{[\s\S]*Entry,[\s\S]*\} from '\.\/defined-types\.generated\.js';/);
+    expect(src).toMatch(/import \{[\s\S]*WIRE_ENTRY_FIELDS,[\s\S]*\} from '\.\/defined-types\.generated\.js';/);
+    expect(src).toMatch(/import \{[\s\S]*IDL_ENTRY_FIELDS,[\s\S]*\} from '\.\/defined-types\.generated\.js';/);
   });
-  it('emits Status enum as a string-literal union', () => {
-    // Status is referenced by no account here, so it should NOT be emitted
-    expect(src).not.toContain('export type Status =');
+  it('does NOT inline Entry interface (lives in defined-types.generated.ts now)', () => {
+    expect(src).not.toContain('export interface Entry {');
+  });
+  it('does NOT inline TYPE_REGISTRY (lives in defined-types.generated.ts now)', () => {
+    expect(src).not.toContain('const TYPE_REGISTRY: TypeRegistry = buildTypeRegistry');
+    // But it must IMPORT TYPE_REGISTRY since parsers use it.
+    expect(src).toMatch(/import \{[\s\S]*TYPE_REGISTRY,[\s\S]*\} from '\.\/defined-types\.generated\.js';/);
+  });
+  it('does not emit Status enum (no account references it)', () => {
+    // Status is referenced by no account here, so it should NOT be imported.
+    // (defined-types.generated.ts may still emit it because instructions might
+    // reference it, but accounts.generated.ts does not pull it in.)
+    expect(src).not.toMatch(/import \{[\s\S]*Status,[\s\S]*\} from '\.\/defined-types\.generated\.js';/);
   });
   it('emits PublicKey for owner field', () => {
     expect(src).toContain('owner: PublicKey;');
@@ -61,13 +77,13 @@ describe('emitAccountsSource — mixed IDL with defined types', () => {
   it('emits Uint8Array for non-32 byte array (label: [u8;16])', () => {
     expect(src).toContain('label: Uint8Array;');
   });
-  it('emits Entry[] for vec<Entry>', () => {
+  it('references Entry[] for vec<Entry>', () => {
     expect(src).toContain('entries: Entry[];');
   });
-  it('emits Entry for single defined struct field', () => {
+  it('references Entry for single defined struct field', () => {
     expect(src).toContain('singleEntry: Entry;');
   });
-  it('contains the WIRE map pointing nested fields to Entry', () => {
+  it('uses WIRE_ENTRY_FIELDS in nested-map literal for Vault parser', () => {
     expect(src).toContain('WIRE_ENTRY_FIELDS');
   });
 });

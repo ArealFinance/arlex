@@ -40,7 +40,7 @@ const program = new Command();
 program
   .name('arlex-cli')
   .description('Tooling for the @arlex/client TypeScript SDK')
-  .version('0.2.2');
+  .version('0.3.0');
 
 /**
  * Validate that `target` resolves inside `cwd`. Returns true if `target`
@@ -161,6 +161,10 @@ program
       });
 
       const targets: Array<{ filename: string; source: string }> = [
+        // defined-types comes first — accounts and instructions import from it
+        // (Phase 3.5 C.2). On a fresh write the order doesn't matter, but for
+        // human readability we list it before its consumers.
+        { filename: sources.filenames.definedTypes, source: sources.definedTypes },
         { filename: sources.filenames.accounts, source: sources.accounts },
         { filename: sources.filenames.instructions, source: sources.instructions },
         { filename: sources.filenames.errors, source: sources.errors },
