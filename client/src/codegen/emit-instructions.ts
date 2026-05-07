@@ -81,6 +81,13 @@ function buildDefinedImportBlock(defined: IdlTypeDef[], hasTypeRegistry: boolean
       const stem = safeConstName(def.name);
       idents.add(`WIRE_${stem}_FIELDS`);
       idents.add(`IDL_${stem}_FIELDS`);
+      // PUBKEY_*/NESTED_MAPS_*/ARRAY_MAPS_* are referenced by the structured
+      // remap-target literal that `nestedMapsLiteral` emits — required for
+      // both the decode (account parsers) and encode (instruction encoders)
+      // sides whenever an arg or field is a defined struct.
+      idents.add(`PUBKEY_${stem}_FIELDS`);
+      idents.add(`NESTED_MAPS_${stem}`);
+      idents.add(`ARRAY_MAPS_${stem}`);
     }
   }
   if (idents.size === 0) return '';

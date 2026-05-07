@@ -13,7 +13,7 @@
 import type { IdlField, IdlType, IdlTypeDef } from '../types';
 import { camelField, pascalType, safeConstName } from './naming';
 import { mapIdlType, mapEnumVariants } from './type-mapper';
-import type { PubkeyOverrides } from './pubkey-detection';
+import { collectPubkeyFieldNames, type PubkeyOverrides } from './pubkey-detection';
 
 export interface DefinedEmitContext {
   registry: Map<string, IdlTypeDef>;
@@ -34,7 +34,35 @@ export function wireMapLiteral(fields: IdlField[]): string {
   return `{\n${entries.join('\n')}\n}`;
 }
 
-/** Build nestedMaps + arrayMaps literal for `defined` struct fields inside a parent type. */
+/**
+ * Build the readonly TS-string-array literal of pubkey-classified
+ * `[u8; 32]` fields for a given parent type. Empty arrays are emitted as
+ * `[]` so the const has a stable, importable identifier even when no
+ * pubkey override applies (callers may still reference it).
+ *
+ * Returns the source-text literal — wire it as
+ * `export const PUBKEY_<STEM>_FIELDS = ${pubkeyFieldsLiteral(...)} as const;`
+ */
+export function pubkeyFieldsLiteral(
+  fields: IdlField[],
+  outerTypeName: string,
+  overrides?: PubkeyOverrides,
+): string {
+  const names = collectPubkeyFieldNames(fields, outerTypeName, overrides).map(camelField);
+  if (names.length === 0) return '[]';
+  return `[\n${names.map(n => `  ${JSON.stringify(n)},`).join('\n')}\n]`;
+}
+
+/**
+ * Build nestedMaps + arrayMaps literal for `defined` struct fields inside a parent type.
+ *
+ * The emitted entries use the structured `NestedRemapTarget` form so the
+ * runtime decoder can also wrap pubkey-classified `[u8; 32]` fields nested
+ * inside defined structs:
+ *   { map: WIRE_FOO_FIELDS, pubkeyFields: PUBKEY_FOO_FIELDS,
+ *     nestedMaps: { ... }, arrayMaps: { ... } }
+ * Each referenced constant is emitted in `defined-types.generated.ts`.
+ */
 export function nestedMapsLiteral(
   fields: IdlField[],
   registry: Map<string, IdlTypeDef>,
@@ -60,9 +88,14 @@ export function nestedMapsLiteral(
     if (inner && 'defined' in inner) {
       const def = registry.get(inner.defined);
       if (def && def.type.kind === 'struct') {
-        const mapName = `WIRE_${safeConstName(def.name)}_FIELDS`;
-        if (isArray) arrayEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
-        else nestedEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
+        const stem = safeConstName(def.name);
+        const mapName = `WIRE_${stem}_FIELDS`;
+        const pkName = `PUBKEY_${stem}_FIELDS`;
+        const nestedName = `NESTED_MAPS_${stem}`;
+        const arraysName = `ARRAY_MAPS_${stem}`;
+        const targetLit = `{ map: ${mapName}, pubkeyFields: ${pkName}, nestedMaps: ${nestedName}, arrayMaps: ${arraysName} }`;
+        if (isArray) arrayEntries.push(`  ${JSON.stringify(tsField)}: ${targetLit},`);
+        else nestedEntries.push(`  ${JSON.stringify(tsField)}: ${targetLit},`);
       }
     }
   }
@@ -136,6 +169,20 @@ export function emitDefinedStructLines(
   lines.push('');
   const constStem = safeConstName(name);
   lines.push(`export const WIRE_${constStem}_FIELDS: WireFieldMap = ${wireMapLiteral(fields)};`);
+  lines.push('');
+  lines.push(`/** Pubkey-classified [u8;32] fields for ${name} (heuristic + overrides). */`);
+  lines.push(`export const PUBKEY_${constStem}_FIELDS = ${pubkeyFieldsLiteral(fields, name, ctx.overrides)} as const;`);
+  lines.push('');
+  // Per-defined-type nested/array maps so the runtime can recurse into
+  // pubkey-classified fields nested inside this struct's defined-struct
+  // children. Always emitted (possibly as `{}`) so consumers can reference
+  // the constant without conditional imports.
+  const { nested, arrays } = nestedMapsLiteral(fields, ctx.registry);
+  lines.push(`/** Nested defined-struct remap targets for ${name} (single, non-array). */`);
+  lines.push(`export const NESTED_MAPS_${constStem} = ${nested} as const;`);
+  lines.push('');
+  lines.push(`/** Nested defined-struct remap targets for ${name} (vec/array of struct). */`);
+  lines.push(`export const ARRAY_MAPS_${constStem} = ${arrays} as const;`);
   lines.push('');
   lines.push(`/** Raw IDL field shape for ${name} — used by the runtime serializer. */`);
   lines.push(`export const IDL_${constStem}_FIELDS: IdlField[] = ${fieldListLiteral(fields)};`);

@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { classifyBytesField, lookupOverride, _PUBKEY_SUFFIXES, _NEGATIVE_TOKENS } from '../../codegen/pubkey-detection';
+import {
+  classifyBytesField,
+  lookupOverride,
+  collectPubkeyFieldNames,
+  _PUBKEY_SUFFIXES,
+  _NEGATIVE_TOKENS,
+} from '../../codegen/pubkey-detection';
+import type { IdlField } from '../../types';
 
 describe('classifyBytesField — heuristic positive', () => {
   // Each suffix should be detected when used as a suffix.
@@ -68,6 +75,51 @@ describe('classifyBytesField — overrides win', () => {
   });
   it('override applied even when length != 32', () => {
     expect(classifyBytesField('foo', 16, 'publicKey')).toBe('publicKey');
+  });
+});
+
+describe('collectPubkeyFieldNames', () => {
+  const fields: IdlField[] = [
+    { name: 'authority', type: { array: ['u8', 32] } }, // pubkey by suffix
+    { name: 'params_hash', type: { array: ['u8', 32] } }, // bytes32 (hash)
+    { name: 'mint', type: { array: ['u8', 32] } }, // pubkey by suffix
+    { name: 'amount', type: 'u64' }, // skipped — not [u8;32]
+    { name: 'small_buf', type: { array: ['u8', 16] } }, // skipped — not 32 bytes
+    { name: 'merkle_root', type: { array: ['u8', 32] } }, // bytes32 (root)
+  ];
+
+  it('returns only [u8;32] fields classified as publicKey, in declaration order', () => {
+    const out = collectPubkeyFieldNames(fields, 'Pool');
+    expect(out).toEqual(['authority', 'mint']);
+  });
+
+  it('skips non-[u8;32] fields entirely', () => {
+    const out = collectPubkeyFieldNames(fields, 'Pool');
+    expect(out).not.toContain('amount');
+    expect(out).not.toContain('small_buf');
+  });
+
+  it('honors override: lifts a hash to publicKey', () => {
+    const overrides = { Pool: { params_hash: 'publicKey' as const } };
+    const out = collectPubkeyFieldNames(fields, 'Pool', overrides);
+    expect(out).toContain('params_hash');
+  });
+
+  it('honors override: demotes an authority to bytes32', () => {
+    const overrides = { Pool: { authority: 'bytes32' as const } };
+    const out = collectPubkeyFieldNames(fields, 'Pool', overrides);
+    expect(out).not.toContain('authority');
+    expect(out).toContain('mint'); // still pubkey via heuristic
+  });
+
+  it('returns empty list when no fields match', () => {
+    expect(collectPubkeyFieldNames([], 'Anything')).toEqual([]);
+    expect(
+      collectPubkeyFieldNames(
+        [{ name: 'amount', type: 'u64' }, { name: 'flag', type: 'bool' }],
+        'X',
+      ),
+    ).toEqual([]);
   });
 });
 

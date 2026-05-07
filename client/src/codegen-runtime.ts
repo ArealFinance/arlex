@@ -52,11 +52,53 @@ export type Bytes32 = Uint8Array;
  */
 export type WireFieldMap = Record<string, string>;
 
+/**
+ * Per-field options passed to a nested-struct remap. Lets the caller hand
+ * the nested level both its own WIRE map AND its own PUBKEY-field set so
+ * that `[u8; 32]` fields inside a defined struct are also wrapped as
+ * `PublicKey` when the override classifies them that way.
+ */
+export interface NestedRemapTarget {
+  map: WireFieldMap;
+  pubkeyFields?: readonly string[];
+  /** Recursive nested options for fields inside this nested struct. */
+  nestedMaps?: Record<string, NestedRemapTarget>;
+  arrayMaps?: Record<string, NestedRemapTarget>;
+}
+
 export interface RemapOptions {
-  /** TS-field-name -> nested WireFieldMap (for `defined` struct fields). */
-  nestedMaps?: Record<string, WireFieldMap>;
-  /** TS-field-name -> nested WireFieldMap (for `vec<defined>` or `[defined; N]`). */
-  arrayMaps?: Record<string, WireFieldMap>;
+  /** TS-field-name -> nested WireFieldMap or {map, pubkeyFields} (for `defined` struct fields). */
+  nestedMaps?: Record<string, WireFieldMap | NestedRemapTarget>;
+  /** TS-field-name -> nested WireFieldMap or {map, pubkeyFields} (for `vec<defined>` or `[defined; N]`). */
+  arrayMaps?: Record<string, WireFieldMap | NestedRemapTarget>;
+  /**
+   * TS-field-names of `[u8; 32]` fields whose decoded `Uint8Array` value
+   * should be wrapped in `new PublicKey(...)`. Set by codegen from the
+   * pubkey-detection classification + sidecar overrides.
+   */
+  pubkeyFields?: readonly string[];
+}
+
+/** Coerce a `WireFieldMap | NestedRemapTarget` into the structured form. */
+function asNestedTarget(v: WireFieldMap | NestedRemapTarget | undefined): NestedRemapTarget | undefined {
+  if (!v) return undefined;
+  // NestedRemapTarget always has a `map` property; a bare WireFieldMap is a
+  // flat string->string record. The `map` key in a WireFieldMap would be a
+  // wire-field name pointing to a TS-field name (string), not an object.
+  const maybeMap = (v as NestedRemapTarget).map;
+  if (maybeMap && typeof maybeMap === 'object') return v as NestedRemapTarget;
+  return { map: v as WireFieldMap };
+}
+
+/**
+ * Wrap a decoded `[u8; 32]` value in a `PublicKey`. Idempotent — returns
+ * the input untouched if it is already a `PublicKey` instance.
+ */
+function wrapPubkey(value: unknown): unknown {
+  if (value instanceof PublicKey) return value;
+  if (value instanceof Uint8Array) return new PublicKey(value);
+  if (Array.isArray(value)) return new PublicKey(Uint8Array.from(value as number[]));
+  return value;
 }
 
 export function remapWireToTs(
@@ -65,19 +107,31 @@ export function remapWireToTs(
   options: RemapOptions = {},
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+  const pubkeySet = options.pubkeyFields ? new Set(options.pubkeyFields) : null;
   for (const wireKey of Object.keys(map)) {
     const tsKey = map[wireKey];
     const value = raw[wireKey];
-    const nested = options.nestedMaps?.[tsKey];
-    const arrayMap = options.arrayMaps?.[tsKey];
-    if (nested && value && typeof value === 'object' && !Array.isArray(value)) {
-      out[tsKey] = remapWireToTs(value as Record<string, unknown>, nested);
+    const nested = asNestedTarget(options.nestedMaps?.[tsKey]);
+    const arrayMap = asNestedTarget(options.arrayMaps?.[tsKey]);
+    if (nested && value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array)) {
+      out[tsKey] = remapWireToTs(value as Record<string, unknown>, nested.map, {
+        nestedMaps: nested.nestedMaps,
+        arrayMaps: nested.arrayMaps,
+        pubkeyFields: nested.pubkeyFields,
+      });
     } else if (arrayMap && Array.isArray(value)) {
       out[tsKey] = value.map(item =>
-        item && typeof item === 'object' && !Array.isArray(item)
-          ? remapWireToTs(item as Record<string, unknown>, arrayMap)
+        item && typeof item === 'object' && !Array.isArray(item) && !(item instanceof Uint8Array)
+          ? remapWireToTs(item as Record<string, unknown>, arrayMap.map, {
+              nestedMaps: arrayMap.nestedMaps,
+              arrayMaps: arrayMap.arrayMaps,
+              pubkeyFields: arrayMap.pubkeyFields,
+            })
           : item,
       );
+    } else if (pubkeySet && pubkeySet.has(tsKey)) {
+      // Apply pubkey-override classification: wrap raw bytes as PublicKey.
+      out[tsKey] = wrapPubkey(value);
     } else {
       out[tsKey] = value;
     }
@@ -98,14 +152,23 @@ export function remapTsToWire(
   for (const wireKey of Object.keys(map)) {
     const tsKey = map[wireKey];
     const value = ts[tsKey];
-    const nested = options.nestedMaps?.[tsKey];
-    const arrayMap = options.arrayMaps?.[tsKey];
-    if (nested && value && typeof value === 'object' && !Array.isArray(value)) {
-      out[wireKey] = remapTsToWire(value as Record<string, unknown>, nested);
+    const nested = asNestedTarget(options.nestedMaps?.[tsKey]);
+    const arrayMap = asNestedTarget(options.arrayMaps?.[tsKey]);
+    // PublicKey instances pass through verbatim — `serializeArgs` knows how
+    // to write them for `[u8; 32]` fields. Treating them as "objects to
+    // recurse into" would corrupt the wire shape.
+    if (nested && value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof PublicKey) && !(value instanceof Uint8Array)) {
+      out[wireKey] = remapTsToWire(value as Record<string, unknown>, nested.map, {
+        nestedMaps: nested.nestedMaps,
+        arrayMaps: nested.arrayMaps,
+      });
     } else if (arrayMap && Array.isArray(value)) {
       out[wireKey] = value.map(item =>
-        item && typeof item === 'object' && !Array.isArray(item)
-          ? remapTsToWire(item as Record<string, unknown>, arrayMap)
+        item && typeof item === 'object' && !Array.isArray(item) && !(item instanceof PublicKey) && !(item instanceof Uint8Array)
+          ? remapTsToWire(item as Record<string, unknown>, arrayMap.map, {
+              nestedMaps: arrayMap.nestedMaps,
+              arrayMaps: arrayMap.arrayMaps,
+            })
           : item,
       );
     } else {
