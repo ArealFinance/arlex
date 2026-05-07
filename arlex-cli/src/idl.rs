@@ -1,5 +1,16 @@
 use serde::Serialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+
+thread_local! {
+    /// Const-name → integer value map for the crate currently being processed.
+    /// Populated by `generate_idl` after `collect_sources` from any
+    /// `pub const <NAME>: usize = <N>;` declarations in the source tree, then
+    /// consulted by `map_type` to resolve array-length idents like
+    /// `[Bin; MAX_BINS]` → `[Bin; 70]`. Cleared between runs.
+    static CONST_USIZE: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+}
 
 #[derive(Serialize, Default)]
 pub struct Idl {
@@ -74,6 +85,16 @@ pub fn generate_idl(project_name: &str) -> Result<Idl, String> {
 
     let source = collect_sources(src_dir)?;
 
+    // Collect `pub const <NAME>: usize = <N>;` declarations so that array
+    // lengths expressed via const idents (e.g. `[Bin; MAX_BINS]`) can be
+    // resolved to their integer values during type mapping.
+    let consts = collect_const_usize(&source);
+    CONST_USIZE.with(|c| {
+        let mut m = c.borrow_mut();
+        m.clear();
+        m.extend(consts.into_iter());
+    });
+
     // Join multi-line signatures into single lines for parsing
     let source = normalize_source(&source);
 
@@ -89,6 +110,7 @@ pub fn generate_idl(project_name: &str) -> Result<Idl, String> {
     parse_derive_accounts(&source, &mut idl);
     parse_errors(&source, &mut idl);
     parse_events(&source, &mut idl);
+    parse_defined_types(&source, &mut idl);
 
     Ok(idl)
 }
@@ -260,6 +282,113 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
         out.push(buf);
     }
     out
+}
+
+/// Parse `pub struct <Name> { ... }` blocks that are NOT classified as
+/// accounts (`#[account]`), events (`#[event]`), or accounts-context
+/// (`#[derive(Accounts)]`). These are "defined types" — auxiliary structs
+/// referenced from account/instruction args (e.g. `Bin`, `RevenueDestination`,
+/// `BatchDestination`) — and must appear in the IDL's `types` array so
+/// downstream codegen can resolve `{ "defined": "<Name>" }` references.
+///
+/// Also captures the names of types already classified as accounts/events
+/// so we don't duplicate them.
+fn parse_defined_types(source: &str, idl: &mut Idl) {
+    // Build a set of names already emitted under `accounts` or `events`.
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in &idl.accounts { taken.insert(a.name.clone()); }
+    for e in &idl.events { taken.insert(e.name.clone()); }
+
+    let mut in_struct = false;
+    let mut name = String::new();
+    let mut fields: Vec<IdlField> = Vec::new();
+    let mut depth = 0i32;
+    // Tracks the most recent attribute on a non-blank, non-comment line.
+    // Reset when a struct starts being parsed or when an unrelated item is seen.
+    let mut recent_attrs: Vec<String> = Vec::new();
+
+    let is_disqualifying = |attrs: &[String]| -> bool {
+        for a in attrs {
+            // Direct attributes that put a struct into another IDL bucket.
+            if a == "#[account]" || a == "#[event]" { return true; }
+            // `#[derive(... Accounts ...)]` marks an instruction context, not
+            // a defined type.
+            if a.starts_with("#[derive(") && a.contains("Accounts") {
+                return true;
+            }
+        }
+        false
+    };
+
+    for line in source.lines() {
+        let t = line.trim();
+
+        if !in_struct {
+            // Skip blank lines and `//` comments — preserve attribute context.
+            if t.is_empty() || t.starts_with("//") { continue; }
+            // Accumulate attributes preceding the next item.
+            if t.starts_with("#[") && t.ends_with(']') {
+                recent_attrs.push(t.to_string());
+                continue;
+            }
+            if t.starts_with("pub struct ") {
+                let nm = extract_struct_name(t);
+                let disqualified = is_disqualifying(&recent_attrs) || taken.contains(&nm);
+                recent_attrs.clear();
+                if disqualified || nm.is_empty() {
+                    // Still need to consume the body so we don't get confused
+                    // about depth on subsequent lines.
+                    let d = t.matches('{').count() as i32 - t.matches('}').count() as i32;
+                    if d > 0 {
+                        // skip body
+                        in_struct = true;
+                        name.clear(); // sentinel: skip mode
+                        depth = d;
+                        fields.clear();
+                    }
+                    // else single-line / unit struct — nothing to consume
+                    continue;
+                }
+                name = nm;
+                depth = t.matches('{').count() as i32 - t.matches('}').count() as i32;
+                fields.clear();
+                in_struct = true;
+                continue;
+            }
+            // Any other item (fn, impl, enum, etc.) clears pending attrs.
+            recent_attrs.clear();
+            continue;
+        }
+
+        // Inside a struct body
+        depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
+        if !name.is_empty() && t.starts_with("pub ") && t.contains(':') {
+            if let Some(f) = parse_field(t) { fields.push(f); }
+        }
+        if depth <= 0 {
+            if !name.is_empty() && !fields.is_empty() {
+                // Emit as a `types` entry — JSON shape mirrors IdlAccountDef
+                // but lives under `types` rather than `accounts`.
+                let mut field_jsons = Vec::with_capacity(fields.len());
+                for f in fields.drain(..) {
+                    field_jsons.push(serde_json::json!({
+                        "name": f.name,
+                        "type": f.ty,
+                    }));
+                }
+                idl.types.push(serde_json::json!({
+                    "name": name,
+                    "type": {
+                        "kind": "struct",
+                        "fields": field_jsons,
+                    }
+                }));
+            }
+            name.clear();
+            fields.clear();
+            in_struct = false;
+        }
+    }
 }
 
 fn parse_account_structs(source: &str, idl: &mut Idl) {
@@ -447,28 +576,154 @@ fn map_type(ty: &str) -> serde_json::Value {
                     return serde_json::json!({"array": ["u8", size]});
                 }
             }
-            // [T; N]
+            // [T; N] — split on the LAST top-level `;` so that nested arrays
+            // like `[[u8; 32]; 10]` are parsed as `[<inner-array>; 10]` rather
+            // than splitting on the inner `;` (which would corrupt both sides).
             if normalized.starts_with('[') && normalized.ends_with(']') && normalized.contains(';') {
                 let inner = &normalized[1..normalized.len()-1];
-                if let Some((t, n)) = inner.split_once(';') {
+                if let Some((t, n)) = split_array_on_last_semicolon(inner) {
                     if let Ok(size) = n.parse::<usize>() {
-                        return serde_json::json!({"array": [map_type(t), size]});
+                        return serde_json::json!({"array": [map_type(&t), size]});
+                    }
+                    // Const-name length (e.g. `MAX_BINS`) — try to resolve from
+                    // the surrounding crate's `pub const <NAME>: usize = N;`
+                    // declarations. If that fails, fall through to `defined`.
+                    if let Some(size) = resolve_const_usize(&n) {
+                        return serde_json::json!({"array": [map_type(&t), size]});
                     }
                 }
             }
-            // Vec<T>
-            if ty.starts_with("Vec<") && ty.ends_with('>') {
-                let inner = &ty[4..ty.len()-1];
+            // Vec<T> — also handle path-prefixed forms that the rustc/syn pretty
+            // printer may emit (e.g. `alloc::vec::Vec<...>`, `std::vec::Vec<...>`,
+            // or even `core::option::Option<...>` for symmetry with Option below).
+            // Strip a leading `<path>::` segment so downstream codegen sees a clean
+            // `{ "vec": <inner> }` shape instead of a raw `defined: "alloc::vec::..."`
+            // identifier (which the @arlex/client codegen rejects as unsafe).
+            let stripped = strip_path_prefix(ty);
+            if stripped.starts_with("Vec<") && stripped.ends_with('>') {
+                let inner = &stripped[4..stripped.len()-1];
                 return serde_json::json!({"vec": map_type(inner)});
             }
             // Option<T>
-            if ty.starts_with("Option<") && ty.ends_with('>') {
-                let inner = &ty[7..ty.len()-1];
+            if stripped.starts_with("Option<") && stripped.ends_with('>') {
+                let inner = &stripped[7..stripped.len()-1];
                 return serde_json::json!({"option": map_type(inner)});
             }
             // Custom type reference
             serde_json::json!({"defined": ty})
         }
+    }
+}
+
+/// Split an array-literal interior (the part inside `[...]`) on its last
+/// top-level `;` — i.e. the `;` that separates the element type from the
+/// length. Returns `(element_type, length_token)` with surrounding whitespace
+/// trimmed. Returns `None` if no top-level `;` is present.
+///
+/// Critically, this does NOT split on `;` inside nested `[...]`, so
+/// `[u8;32];10` correctly yields (`[u8;32]`, `10`) instead of (`[u8`, `32];10`)
+/// from the previous naive `split_once(';')`.
+fn split_array_on_last_semicolon(inner: &str) -> Option<(String, String)> {
+    let bytes = inner.as_bytes();
+    let mut depth: i32 = 0;
+    let mut last_semi: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            b';' if depth == 0 => last_semi = Some(i),
+            _ => {}
+        }
+    }
+    let idx = last_semi?;
+    let lhs = inner[..idx].trim().to_string();
+    let rhs = inner[idx + 1..].trim().to_string();
+    Some((lhs, rhs))
+}
+
+/// Resolve an array-length token like `MAX_BINS` to its integer value via the
+/// `CONST_USIZE` thread-local that `generate_idl` populates from
+/// `pub const <NAME>: usize = N;` declarations. Returns `None` for unknown
+/// idents (caller falls back to the `defined` shape).
+///
+/// Path-prefixed forms like `crate::constants::MAX_BINS` are stripped to
+/// their last `::` segment before lookup, matching how `strip_path_prefix`
+/// handles `Vec<T>` paths.
+fn resolve_const_usize(name: &str) -> Option<usize> {
+    let bare = strip_path_prefix(name);
+    CONST_USIZE.with(|c| c.borrow().get(bare).copied())
+}
+
+/// Scan source for `pub const <NAME>: usize = <N>;` declarations and return a
+/// map of name → integer value. Tolerates whitespace, hex/decimal literals,
+/// and underscored numerics (`1_000_000` → `1000000`). Skips any line that
+/// doesn't parse cleanly. This is a best-effort scanner — Rust expressions
+/// (e.g. `2 * 5`) are ignored; only literal integer values are captured.
+fn collect_const_usize(source: &str) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    for raw in source.lines() {
+        // Tolerate optional `pub(crate)` / `pub` and any leading whitespace.
+        let line = raw.trim();
+        let body = match line.strip_prefix("pub const ").or_else(|| line.strip_prefix("pub(crate) const ").or_else(|| line.strip_prefix("const "))) {
+            Some(b) => b,
+            None => continue,
+        };
+        // Expected: `<NAME>: usize = <N>;`  (optionally with extra suffixes/comments)
+        let (name, after_name) = match body.split_once(':') {
+            Some(p) => p,
+            None => continue,
+        };
+        let name = name.trim();
+        // Require usize annotation to avoid grabbing unrelated u8/u32 consts.
+        let after_ty = match after_name.trim_start().strip_prefix("usize") {
+            Some(s) => s,
+            None => continue,
+        };
+        let after_eq = match after_ty.split_once('=') {
+            Some((_, rhs)) => rhs.trim(),
+            None => continue,
+        };
+        // Take everything up to the first `;` as the value expression.
+        let value_str = match after_eq.split_once(';') {
+            Some((v, _)) => v.trim(),
+            None => continue,
+        };
+        // Strip underscores; ignore hex/binary prefixes for now.
+        let cleaned: String = value_str.chars().filter(|c| *c != '_').collect();
+        if let Ok(n) = cleaned.parse::<usize>() {
+            out.insert(name.to_string(), n);
+        }
+    }
+    out
+}
+
+/// Strip a fully-qualified Rust path prefix from a type ident, returning only
+/// the trailing component. E.g. `alloc::vec::Vec<T>` → `Vec<T>`,
+/// `core::option::Option<T>` → `Option<T>`, `Foo` → `Foo`.
+///
+/// Splits on the LAST `::` outside any generic brackets so generics in the
+/// suffix are preserved verbatim.
+fn strip_path_prefix(ty: &str) -> &str {
+    let bytes = ty.as_bytes();
+    let mut depth: i32 = 0;
+    let mut last_sep: Option<usize> = None;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let c = bytes[i];
+        if c == b'<' {
+            depth += 1;
+        } else if c == b'>' {
+            depth -= 1;
+        } else if depth == 0 && c == b':' && bytes[i + 1] == b':' {
+            last_sep = Some(i + 2);
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    match last_sep {
+        Some(idx) => &ty[idx..],
+        None => ty,
     }
 }
 
@@ -879,8 +1134,9 @@ pub enum Errors {
     #[test]
     fn test_parse_fn_sig_vec_of_arrays_arg() {
         // alloc::vec::Vec<[u8; 32]> — the type contains commas-free generics
-        // but earlier `,`-split would still trip on the inline body. Also
-        // exercises the `Vec<...>` mapping with a path-prefixed name.
+        // but earlier `,`-split would still trip on the inline body. The path
+        // prefix is now stripped so the result is `{vec: {array: ["u8", 32]}}`,
+        // which downstream codegen can consume.
         let line = "pub fn claim(ctx: Context<Claim>, cumulative_amount: u64, proof: alloc::vec::Vec<[u8; 32]>) -> Result<()>";
         let ix = parse_fn_sig(line).unwrap();
         assert_eq!(ix.name, "claim");
@@ -888,15 +1144,119 @@ pub enum Errors {
         assert_eq!(ix.args[0].name, "cumulative_amount");
         assert_eq!(ix.args[0].ty, serde_json::json!("u64"));
         assert_eq!(ix.args[1].name, "proof");
-        // alloc::vec::Vec<...> isn't recognized as `Vec<...>` (path prefix);
-        // it should fall to a custom `defined` reference, but crucially the
-        // value must be a clean type — not `") -> Result<("`-style garbage.
-        // We assert it parses and the value matches a safe identifier shape
-        // (no `)` or `(` or `>` interlopers from outside the arg list).
-        let ty_str = ix.args[1].ty["defined"].as_str().unwrap_or("");
-        assert!(!ty_str.is_empty(), "type should resolve, got {:?}", ix.args[1].ty);
-        assert!(!ty_str.contains(')'), "type leaked closing paren: {ty_str:?}");
-        assert!(!ty_str.contains("Result"), "type leaked return type: {ty_str:?}");
+        assert_eq!(
+            ix.args[1].ty,
+            serde_json::json!({"vec": {"array": ["u8", 32]}}),
+            "alloc::vec::Vec<[u8; 32]> must map to {{vec: {{array: [u8, 32]}}}}"
+        );
+    }
+
+    #[test]
+    fn test_map_type_vec_path_prefixed() {
+        // Direct map_type tests for the path-prefixed Vec/Option forms that
+        // rustc/syn pretty-printers can emit.
+        assert_eq!(
+            map_type("alloc::vec::Vec<u64>"),
+            serde_json::json!({"vec": "u64"})
+        );
+        assert_eq!(
+            map_type("std::vec::Vec<BatchDestination>"),
+            serde_json::json!({"vec": {"defined": "BatchDestination"}})
+        );
+        assert_eq!(
+            map_type("core::option::Option<u64>"),
+            serde_json::json!({"option": "u64"})
+        );
+        // Bare forms still work
+        assert_eq!(map_type("Vec<u8>"), serde_json::json!({"vec": "u8"}));
+        assert_eq!(map_type("Option<Pubkey>"), serde_json::json!({"option": "publicKey"}));
+    }
+
+    #[test]
+    fn test_split_array_on_last_semicolon_simple() {
+        // [u8; 32] interior is `u8;32`
+        let r = split_array_on_last_semicolon("u8;32").unwrap();
+        assert_eq!(r, ("u8".to_string(), "32".to_string()));
+    }
+
+    #[test]
+    fn test_split_array_on_last_semicolon_nested() {
+        // [[u8; 32]; 10] interior is `[u8;32];10` — must split on the OUTER `;`
+        let r = split_array_on_last_semicolon("[u8;32];10").unwrap();
+        assert_eq!(r, ("[u8;32]".to_string(), "10".to_string()));
+    }
+
+    #[test]
+    fn test_split_array_on_last_semicolon_const_length() {
+        // [Bin; MAX_BINS] interior is `Bin;MAX_BINS`
+        let r = split_array_on_last_semicolon("Bin;MAX_BINS").unwrap();
+        assert_eq!(r, ("Bin".to_string(), "MAX_BINS".to_string()));
+    }
+
+    #[test]
+    fn test_map_type_nested_array_literal_length() {
+        // [[u8; 32]; 10] must yield {array: [{array: [u8, 32]}, 10]}
+        assert_eq!(
+            map_type("[[u8; 32]; 10]"),
+            serde_json::json!({"array": [{"array": ["u8", 32]}, 10]})
+        );
+    }
+
+    #[test]
+    fn test_map_type_array_const_length_resolves() {
+        // Seed CONST_USIZE with fake values and ensure both bare and
+        // path-prefixed const-name lengths resolve to the integer form.
+        CONST_USIZE.with(|c| {
+            c.borrow_mut().insert("MAX_DESTINATIONS".to_string(), 10);
+            c.borrow_mut().insert("MAX_BINS".to_string(), 70);
+        });
+        assert_eq!(
+            map_type("[RevenueDestination; MAX_DESTINATIONS]"),
+            serde_json::json!({"array": [{"defined": "RevenueDestination"}, 10]})
+        );
+        assert_eq!(
+            map_type("[Bin; MAX_BINS]"),
+            serde_json::json!({"array": [{"defined": "Bin"}, 70]})
+        );
+        // Path-prefixed const name (e.g. `crate::constants::MAX_BINS`)
+        assert_eq!(
+            map_type("[Bin; crate::constants::MAX_BINS]"),
+            serde_json::json!({"array": [{"defined": "Bin"}, 70]})
+        );
+        // Cleanup so other tests aren't polluted
+        CONST_USIZE.with(|c| c.borrow_mut().clear());
+    }
+
+    #[test]
+    fn test_collect_const_usize() {
+        let src = "
+            pub const MAX_DESTINATIONS: usize = 10;
+            pub const MAX_BINS: usize = 70;
+            pub(crate) const INTERNAL_LIMIT: usize = 16;
+            const PRIVATE: usize = 1_000;
+            pub const NOT_USIZE: u32 = 5;
+            pub const COMPUTED: usize = 2 * 5;  // expression — should be skipped
+        ";
+        let m = collect_const_usize(src);
+        assert_eq!(m.get("MAX_DESTINATIONS"), Some(&10));
+        assert_eq!(m.get("MAX_BINS"), Some(&70));
+        assert_eq!(m.get("INTERNAL_LIMIT"), Some(&16));
+        assert_eq!(m.get("PRIVATE"), Some(&1000));
+        assert_eq!(m.get("NOT_USIZE"), None);
+        assert_eq!(m.get("COMPUTED"), None);
+    }
+
+    #[test]
+    fn test_strip_path_prefix() {
+        assert_eq!(strip_path_prefix("Foo"), "Foo");
+        assert_eq!(strip_path_prefix("alloc::vec::Vec<u8>"), "Vec<u8>");
+        assert_eq!(strip_path_prefix("std::vec::Vec<[u8; 32]>"), "Vec<[u8; 32]>");
+        assert_eq!(strip_path_prefix("core::option::Option<u64>"), "Option<u64>");
+        // Generics containing `::` must NOT be split on the inner `::`
+        assert_eq!(
+            strip_path_prefix("Vec<alloc::vec::Vec<u8>>"),
+            "Vec<alloc::vec::Vec<u8>>"
+        );
     }
 
     #[test]
