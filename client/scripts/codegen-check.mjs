@@ -69,13 +69,18 @@ async function main() {
         const idl = parseIdlJson(text);
         const out = generateTypes(idl);
         // sanity: each output must contain the banner line
-        for (const [name, src] of [['accounts', out.accounts], ['instructions', out.instructions], ['errors', out.errors]]) {
+        for (const [name, src] of [
+          ['accounts', out.accounts],
+          ['instructions', out.instructions],
+          ['errors', out.errors],
+          ['definedTypes', out.definedTypes],
+        ]) {
           if (!src.includes('AUTO-GENERATED')) {
             process.stderr.write(`error: ${idlPath} → ${name} missing banner\n`);
             process.exit(1);
           }
         }
-        process.stdout.write(`ok   ${path.basename(idlPath)}  (acc=${out.accounts.length}, ix=${out.instructions.length}, err=${out.errors.length} chars)\n`);
+        process.stdout.write(`ok   ${path.basename(idlPath)}  (acc=${out.accounts.length}, ix=${out.instructions.length}, err=${out.errors.length}, def=${out.definedTypes.length} chars)\n`);
       } catch (err) {
         process.stderr.write(`fail ${path.basename(idlPath)}: ${err.message}\n`);
         process.exit(1);

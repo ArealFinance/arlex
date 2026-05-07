@@ -8,25 +8,25 @@
  *   - `encode<Name>Args(args): Buffer` — wraps `serializeArgs`.
  *   - `WIRE_<NAME>_ARG_FIELDS` snake/camel map.
  *
- * Defined struct types referenced from instruction args are emitted (in
- * dependency order) at the top of the file with their interface, wire map,
- * and IDL field-list constants.
+ * Phase 3.5 C.2 — defined struct/enum interfaces, their WIRE/IDL field
+ * constants, and the program-wide TYPE_REGISTRY are no longer emitted
+ * here. They live in `defined-types.generated.ts` (single source of
+ * truth per program) and are imported below.
  */
-import type { IdlField, IdlInstruction, IdlType, IdlTypeDef } from '../types';
+import type { IdlInstruction, IdlType, IdlTypeDef } from '../types';
 import { camelField, pascalType, safeConstName } from './naming';
-import { mapIdlType, mapEnumVariants, UnsupportedTypeError } from './type-mapper';
+import { mapIdlType, UnsupportedTypeError } from './type-mapper';
 import { instructionDiscriminator } from '../discriminator';
 import type { PubkeyOverrides } from './pubkey-detection';
 import type { NormalizedIdl } from './parser';
+import {
+  fieldListLiteral,
+  wireMapLiteral,
+  nestedMapsLiteral,
+} from './emit-defined';
 
 export interface EmitInstructionsOptions {
   overrides?: PubkeyOverrides;
-}
-
-interface EmitContext {
-  registry: Map<string, IdlTypeDef>;
-  overrides?: PubkeyOverrides;
-  emittedDefined: Set<string>;
 }
 
 function toUint8ArrayLiteral(buf: Buffer): string {
@@ -34,109 +34,15 @@ function toUint8ArrayLiteral(buf: Buffer): string {
   return `new Uint8Array([${items.join(', ')}])`;
 }
 
-function fieldListLiteral(fields: IdlField[]): string {
-  return JSON.stringify(fields, null, 2);
-}
-
-function wireMapLiteral(fields: IdlField[]): string {
-  if (fields.length === 0) return '{}';
-  const entries = fields.map(f => `  ${JSON.stringify(f.name)}: ${JSON.stringify(camelField(f.name))},`);
-  return `{\n${entries.join('\n')}\n}`;
-}
-
-function nestedMapsLiteral(fields: IdlField[], registry: Map<string, IdlTypeDef>): { nested: string; arrays: string } {
-  const nestedEntries: string[] = [];
-  const arrayEntries: string[] = [];
-  for (const f of fields) {
-    const tsField = camelField(f.name);
-    let inner: IdlType | null = null;
-    let isArray = false;
-    if (typeof f.type === 'object') {
-      if ('defined' in f.type) inner = f.type;
-      else if ('vec' in f.type && typeof f.type.vec === 'object' && 'defined' in f.type.vec) {
-        inner = f.type.vec;
-        isArray = true;
-      } else if ('array' in f.type && typeof f.type.array[0] === 'object' && 'defined' in f.type.array[0]) {
-        inner = f.type.array[0];
-        isArray = true;
-      } else if ('option' in f.type && typeof f.type.option === 'object' && 'defined' in f.type.option) {
-        inner = f.type.option;
-      }
-    }
-    if (inner && 'defined' in inner) {
-      const def = registry.get(inner.defined);
-      if (def && def.type.kind === 'struct') {
-        const mapName = `WIRE_${safeConstName(def.name)}_FIELDS`;
-        if (isArray) arrayEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
-        else nestedEntries.push(`  ${JSON.stringify(tsField)}: ${mapName},`);
-      }
-    }
-  }
-  const nested = nestedEntries.length === 0 ? '{}' : `{\n${nestedEntries.join('\n')}\n}`;
-  const arrays = arrayEntries.length === 0 ? '{}' : `{\n${arrayEntries.join('\n')}\n}`;
-  return { nested, arrays };
-}
-
-function fieldsContainDefinedStruct(fields: IdlField[], registry: Map<string, IdlTypeDef>): string[] {
-  const names: string[] = [];
-  const visit = (type: IdlType) => {
-    if (typeof type === 'string') return;
-    if ('vec' in type) return visit(type.vec);
-    if ('option' in type) return visit(type.option);
-    if ('array' in type) return visit(type.array[0]);
-    if ('defined' in type) {
-      const def = registry.get(type.defined);
-      if (def && def.type.kind === 'struct') names.push(type.defined);
-    }
-  };
-  for (const f of fields) visit(f.type);
-  return names;
-}
-
-function emitDefinedStruct(name: string, fields: IdlField[], ctx: EmitContext, lines: string[]): void {
-  if (ctx.emittedDefined.has(name)) return;
-  for (const inner of fieldsContainDefinedStruct(fields, ctx.registry)) {
-    if (ctx.emittedDefined.has(inner)) continue;
-    const def = ctx.registry.get(inner);
-    if (def && def.type.kind === 'struct' && def.type.fields) {
-      emitDefinedStruct(inner, def.type.fields, ctx, lines);
-    }
-  }
-  ctx.emittedDefined.add(name);
-  const tsName = pascalType(name);
-  lines.push(`/** Defined struct from IDL: ${name} */`);
-  lines.push(`export interface ${tsName} {`);
-  for (const f of fields) {
-    const tsField = camelField(f.name);
-    const tsType = mapIdlType(f.type, {
-      registry: ctx.registry,
-      overrides: ctx.overrides,
-      outerTypeName: name,
-      fieldName: f.name,
-    });
-    lines.push(`  ${tsField}: ${tsType};`);
-  }
-  lines.push(`}`);
-  lines.push('');
-  const constStem = safeConstName(name);
-  lines.push(`export const WIRE_${constStem}_FIELDS: WireFieldMap = ${wireMapLiteral(fields)};`);
-  lines.push('');
-  lines.push(`/** Raw IDL field shape for ${name} — used by the runtime serializer. */`);
-  lines.push(`export const IDL_${constStem}_FIELDS: IdlField[] = ${fieldListLiteral(fields)};`);
-  lines.push('');
-}
-
-function emitDefinedEnum(name: string, def: IdlTypeDef, ctx: EmitContext, lines: string[]): void {
-  if (ctx.emittedDefined.has(name)) return;
-  ctx.emittedDefined.add(name);
-  const tsName = pascalType(name);
-  const variants = mapEnumVariants(def);
-  lines.push(`/** Defined enum (tag-only) from IDL: ${name} */`);
-  lines.push(`export type ${tsName} = ${variants};`);
-  lines.push('');
-}
-
-function collectDefinedFromInstructions(ixs: IdlInstruction[], registry: Map<string, IdlTypeDef>): IdlTypeDef[] {
+/**
+ * Walk instructions and collect every `defined` type referenced from arg
+ * fields. Mirrors `collectDefinedFromAll` ordering for deterministic
+ * import blocks.
+ */
+function collectDefinedFromInstructions(
+  ixs: IdlInstruction[],
+  registry: Map<string, IdlTypeDef>,
+): IdlTypeDef[] {
   const seen = new Set<string>();
   const order: IdlTypeDef[] = [];
   const visit = (type: IdlType) => {
@@ -161,13 +67,32 @@ function collectDefinedFromInstructions(ixs: IdlInstruction[], registry: Map<str
   return order;
 }
 
+/**
+ * Build the `import { ... } from './defined-types.generated.js';` block.
+ * Imports are sorted alphabetically inside the brace block for
+ * deterministic output.
+ */
+function buildDefinedImportBlock(defined: IdlTypeDef[], hasTypeRegistry: boolean): string {
+  const idents = new Set<string>();
+  if (hasTypeRegistry) idents.add('TYPE_REGISTRY');
+  for (const def of defined) {
+    idents.add(pascalType(def.name));
+    if (def.type.kind === 'struct') {
+      const stem = safeConstName(def.name);
+      idents.add(`WIRE_${stem}_FIELDS`);
+      idents.add(`IDL_${stem}_FIELDS`);
+    }
+  }
+  if (idents.size === 0) return '';
+  const sorted = Array.from(idents).sort();
+  const lines = [`import {`];
+  for (const id of sorted) lines.push(`  ${id},`);
+  lines.push(`} from './defined-types.generated.js';`);
+  return lines.join('\n');
+}
+
 /** Emit `instructions.generated.ts` source. */
 export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstructionsOptions = {}): string {
-  const ctx: EmitContext = {
-    registry: idl.definedRegistry,
-    overrides: options.overrides,
-    emittedDefined: new Set<string>(),
-  };
   const lines: string[] = [];
 
   // Explicit Buffer import — required for browser bundlers (Vite/Rollup) which
@@ -182,8 +107,6 @@ export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstruct
     `  type Bytes32,`,
     `  type WireFieldMap,`,
     `  type IdlField,`,
-    `  type TypeRegistry,`,
-    `  buildTypeRegistry,`,
     `  serializeArgs,`,
     `  instructionDiscriminator,`,
     `  remapTsToWire,`,
@@ -191,25 +114,12 @@ export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstruct
     '',
   );
 
+  // Pull defined types + TYPE_REGISTRY from the per-program shared file.
   const defined = collectDefinedFromInstructions(idl.instructions, idl.definedRegistry);
-  for (const def of defined) {
-    if (def.type.kind === 'enum') {
-      emitDefinedEnum(def.name, def, ctx, lines);
-    } else if (def.type.kind === 'struct' && def.type.fields) {
-      emitDefinedStruct(def.name, def.type.fields, ctx, lines);
-    }
-  }
-
-  if (idl.types.length > 0 || idl.accounts.length > 0) {
-    const typesLiteral = idl.types.length
-      ? JSON.stringify(idl.types)
-      : '[]';
-    const accountsLiteral = idl.accounts.length
-      ? JSON.stringify(idl.accounts.map(a => ({ name: a.name, type: a.type })))
-      : '[]';
-    lines.push(`/** Type registry shared across all instruction encoders in this module. */`);
-    lines.push(`const TYPE_REGISTRY: TypeRegistry = buildTypeRegistry(${typesLiteral} as any, ${accountsLiteral} as any);`);
-    lines.push('');
+  const hasTypeRegistry = idl.types.length > 0 || idl.accounts.length > 0;
+  const importBlock = buildDefinedImportBlock(defined, hasTypeRegistry);
+  if (importBlock) {
+    lines.push(importBlock, '');
   }
 
   for (const ix of idl.instructions) {
@@ -247,8 +157,8 @@ export function emitInstructionsSource(idl: NormalizedIdl, options: EmitInstruct
         let tsType: string;
         try {
           tsType = mapIdlType(f.type, {
-            registry: ctx.registry,
-            overrides: ctx.overrides,
+            registry: idl.definedRegistry,
+            overrides: options.overrides,
             outerTypeName: ix.name,
             fieldName: f.name,
           });

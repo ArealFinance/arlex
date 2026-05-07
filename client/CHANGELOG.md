@@ -1,5 +1,25 @@
 # @arlex/client changelog
 
+## 0.3.0 — 2026-05-07
+
+- **BREAKING (codegen output)**: per-program `defined-types.generated.ts`
+  file added. Generated programs now have 4 files instead of 3:
+  - `accounts.generated.ts`
+  - `instructions.generated.ts`
+  - `errors.generated.ts`
+  - `defined-types.generated.ts` (NEW)
+
+  Defined struct/enum interfaces, `WIRE_*_FIELDS` maps, `IDL_*_FIELDS`
+  constants, and `TYPE_REGISTRY` are now emitted ONCE per program in
+  `defined-types.generated.ts` instead of duplicated across
+  `accounts.generated.ts` and `instructions.generated.ts`.
+
+  Consumers of generated code must add
+  `export * from './defined-types.generated.js';` to their program index
+  re-exporters. No runtime API changes to `ArlexClient` or
+  `codegen-runtime`. Phase 3.5 C.2.
+- **chore(cli)**: bump hardcoded CLI `--version` string to `0.3.0`.
+
 ## 0.2.2 — 2026-05-06
 
 - **fix(codegen)**: codegen template now emits explicit `import { Buffer } from 'buffer'`

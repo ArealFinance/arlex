@@ -58,7 +58,7 @@ describe('arlex-cli E2E', () => {
     expect(res.stdout).toContain('generate-types');
   });
 
-  it('generate-types <idl> --out <dir> writes 3 files', () => {
+  it('generate-types <idl> --out <dir> writes 4 files', () => {
     const outDir = mkdtempSync(join(tmpdir(), 'arlex-cli-e2e-'));
     // tmpdir() is outside the package cwd, so we need --allow-out-outside-cwd
     // (WARN-1 guard in cli.ts). The fixture path is also outside cwd when
@@ -80,6 +80,8 @@ describe('arlex-cli E2E', () => {
     expect(existsSync(join(outDir, 'accounts.generated.ts'))).toBe(true);
     expect(existsSync(join(outDir, 'instructions.generated.ts'))).toBe(true);
     expect(existsSync(join(outDir, 'errors.generated.ts'))).toBe(true);
+    // Phase 3.5 C.2 — per-program shared defined types file.
+    expect(existsSync(join(outDir, 'defined-types.generated.ts'))).toBe(true);
   });
 
   it('generated accounts.generated.ts contains explicit Buffer import (G3 follow-up)', () => {

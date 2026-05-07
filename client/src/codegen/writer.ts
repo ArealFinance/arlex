@@ -97,6 +97,8 @@ export async function checkDrift(filePath: string, content: string): Promise<boo
 export const GENERATED_SUFFIX = '.generated.ts';
 
 /** Build a generated filename from a logical kind. */
-export function generatedFilename(kind: 'accounts' | 'instructions' | 'errors'): string {
+export function generatedFilename(
+  kind: 'accounts' | 'instructions' | 'errors' | 'defined-types',
+): string {
   return `${kind}${GENERATED_SUFFIX}`;
 }
