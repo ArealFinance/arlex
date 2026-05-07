@@ -1,5 +1,28 @@
 # @arlex/client changelog
 
+## 0.3.1 — 2026-05-07
+
+- **fix(codegen)**: runtime parsers now honor pubkey overrides at decode
+  time. Previously, generated `.d.ts` types declared `PublicKey` for
+  pubkey-overridden `[u8; 32]` fields, but the runtime Borsh decoder
+  returned raw `Uint8Array` (`number[]` shape on the wire) — forcing
+  consumers to write a `toPublicKey(...)` adapter to bridge the gap.
+
+  Codegen now emits a `PUBKEY_<NAME>_FIELDS` const for each account /
+  defined struct listing the TS field names classified as `publicKey`
+  (heuristic + sidecar overrides). Generated `parse*` parsers thread that
+  list into `remapWireToTs` via the new `pubkeyFields` option, and
+  matching values are wrapped in `new PublicKey(...)` directly. Nested
+  defined structs use the structured `NestedRemapTarget` form so the
+  wrapping recurses through `vec<defined>` / `[defined; N]` field shapes.
+
+  No public API changes to `ArlexClient` or `codegen-runtime` (additive
+  only — the new `pubkeyFields` option is optional, and the existing
+  flat `WireFieldMap` shape for `nestedMaps`/`arrayMaps` still works).
+  Encode side: `serializeArgs` now also accepts a `PublicKey` value for
+  `[u8; 32]` fields (it already accepted Buffer / Uint8Array / number[]).
+- **chore(cli)**: bump hardcoded CLI `--version` string to `0.3.1`.
+
 ## 0.3.0 — 2026-05-07
 
 - **BREAKING (codegen output)**: per-program `defined-types.generated.ts`

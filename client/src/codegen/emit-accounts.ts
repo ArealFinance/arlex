@@ -22,6 +22,7 @@ import {
   fieldListLiteral,
   wireMapLiteral,
   nestedMapsLiteral,
+  pubkeyFieldsLiteral,
 } from './emit-defined';
 
 export interface EmitAccountsOptions {
@@ -90,6 +91,9 @@ function buildDefinedImportBlock(defined: IdlTypeDef[], hasTypeRegistry: boolean
       const stem = safeConstName(def.name);
       idents.add(`WIRE_${stem}_FIELDS`);
       idents.add(`IDL_${stem}_FIELDS`);
+      idents.add(`PUBKEY_${stem}_FIELDS`);
+      idents.add(`NESTED_MAPS_${stem}`);
+      idents.add(`ARRAY_MAPS_${stem}`);
     }
   }
   if (idents.size === 0) return '';
@@ -174,6 +178,10 @@ export function emitAccountsSource(idl: NormalizedIdl, options: EmitAccountsOpti
     lines.push(`export const WIRE_${constStem}_FIELDS: WireFieldMap = ${wireMapLiteral(acc.type.fields)};`);
     lines.push('');
 
+    lines.push(`/** Pubkey-classified [u8;32] fields for ${acc.name} (heuristic + overrides). */`);
+    lines.push(`export const PUBKEY_${constStem}_FIELDS = ${pubkeyFieldsLiteral(acc.type.fields, acc.name, options.overrides)} as const;`);
+    lines.push('');
+
     lines.push(`const IDL_${constStem}_FIELDS: IdlField[] = ${fieldListLiteral(acc.type.fields)};`);
     lines.push('');
 
@@ -189,6 +197,7 @@ export function emitAccountsSource(idl: NormalizedIdl, options: EmitAccountsOpti
     lines.push(`  return remapWireToTs(raw, WIRE_${constStem}_FIELDS, {`);
     lines.push(`    nestedMaps: ${nested},`);
     lines.push(`    arrayMaps: ${arrays},`);
+    lines.push(`    pubkeyFields: PUBKEY_${constStem}_FIELDS,`);
     lines.push(`  }) as unknown as ${tsName};`);
     lines.push(`}`);
     lines.push('');

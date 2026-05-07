@@ -11,6 +11,7 @@
  * Inputs are the raw IDL field name (snake_case is expected, but we
  * normalize defensively so camelCase also works).
  */
+import type { IdlField } from '../types';
 
 export type PubkeyClassification = 'publicKey' | 'bytes32';
 
@@ -122,6 +123,36 @@ export function lookupOverride(
   const norm = normalize(fieldName);
   if (typeMap[norm]) return typeMap[norm];
   return undefined;
+}
+
+/**
+ * Walk a list of IDL fields and return the (raw IDL) names of every
+ * `[u8; 32]` field classified as `publicKey` (per heuristic + overrides).
+ *
+ * Used by codegen to emit a `PUBKEY_<TYPE>_FIELDS` set so the runtime
+ * decoder can wrap matching values with `new PublicKey(...)`. Without this,
+ * runtime parsers return `Uint8Array` for pubkey-overridden fields even
+ * though the emitted `.d.ts` types declare `PublicKey`.
+ *
+ * Fields are returned in declaration order. Only top-level `[u8; 32]`
+ * fields are inspected — nested defined-struct fields are handled by
+ * the consumer of those types via their own PUBKEY_* set.
+ */
+export function collectPubkeyFieldNames(
+  fields: IdlField[],
+  outerTypeName: string,
+  overrides?: PubkeyOverrides,
+): string[] {
+  const result: string[] = [];
+  for (const f of fields) {
+    if (typeof f.type !== 'object' || !('array' in f.type)) continue;
+    const [item, size] = f.type.array;
+    if (item !== 'u8' || size !== 32) continue;
+    const override = lookupOverride(overrides, outerTypeName, f.name);
+    const cls = classifyBytesField(f.name, size, override);
+    if (cls === 'publicKey') result.push(f.name);
+  }
+  return result;
 }
 
 /** Constants exported for tests. */

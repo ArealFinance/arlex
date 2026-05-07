@@ -40,7 +40,7 @@ const program = new Command();
 program
   .name('arlex-cli')
   .description('Tooling for the @arlex/client TypeScript SDK')
-  .version('0.3.0');
+  .version('0.3.1');
 
 /**
  * Validate that `target` resolves inside `cwd`. Returns true if `target`

@@ -88,11 +88,21 @@ function serializeType(type: IdlType, value: any, registry?: TypeRegistry): Buff
 
   if ('array' in type) {
     const [itemType, size] = type.array;
-    if (itemType === 'u8' && (Buffer.isBuffer(value) || Array.isArray(value))) {
-      const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      const result = Buffer.alloc(size);
-      buf.copy(result, 0, 0, Math.min(buf.length, size));
-      return result;
+    if (itemType === 'u8') {
+      // Accept Buffer / Uint8Array / number[] / PublicKey (pubkey-classified
+      // [u8;32] fields). PublicKey first so its `.toBuffer()` is preferred
+      // over the iterable-array fallback.
+      if (value instanceof PublicKey) {
+        const result = Buffer.alloc(size);
+        value.toBuffer().copy(result, 0, 0, Math.min(32, size));
+        return result;
+      }
+      if (Buffer.isBuffer(value) || value instanceof Uint8Array || Array.isArray(value)) {
+        const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        const result = Buffer.alloc(size);
+        buf.copy(result, 0, 0, Math.min(buf.length, size));
+        return result;
+      }
     }
     const bufs = [];
     for (let i = 0; i < size; i++) bufs.push(serializeType(itemType, value[i], registry));
