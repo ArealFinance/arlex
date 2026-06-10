@@ -139,6 +139,49 @@ describe('serialization', () => {
       const result = roundtrip(fields, { vals: [BigInt(1), BigInt(2), BigInt(3)] });
       expect(result.vals).toEqual([BigInt(1), BigInt(2), BigInt(3)]);
     });
+
+    // Finding 6: [u8; N] must reject length mismatch instead of silently
+    // truncating/zero-padding (a wrong-length pubkey -> valid-looking WRONG key).
+    it('[u8; 32] exact-length Buffer roundtrips', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      const input = Buffer.alloc(32, 0x7F);
+      const buf = serializeArgs(fields, { key: input });
+      expect(buf.length).toBe(32);
+      const result = roundtrip(fields, { key: input });
+      expect(Buffer.from(result.key)).toEqual(input);
+    });
+
+    it('[u8; 32] exact-length number[] roundtrips', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      const input = Array.from({ length: 32 }, (_, i) => i);
+      const result = roundtrip(fields, { key: input });
+      expect([...result.key]).toEqual(input);
+    });
+
+    it('[u8; 32] longer Buffer (40 bytes) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      expect(() => serializeArgs(fields, { key: Buffer.alloc(40, 0xAB) }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 40');
+    });
+
+    it('[u8; 32] shorter Buffer (4 bytes) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      expect(() => serializeArgs(fields, { key: Buffer.alloc(4) }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 4');
+    });
+
+    it('[u8; 32] longer number[] (40) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      const input = new Array(40).fill(1);
+      expect(() => serializeArgs(fields, { key: input }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 40');
+    });
+
+    it('[u8; 32] shorter number[] (4) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      expect(() => serializeArgs(fields, { key: [1, 2, 3, 4] }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 4');
+    });
   });
 
   // ==================== Vec ====================

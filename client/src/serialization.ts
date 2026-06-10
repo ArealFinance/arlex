@@ -90,8 +90,13 @@ function serializeType(type: IdlType, value: any, registry?: TypeRegistry): Buff
     const [itemType, size] = type.array;
     if (itemType === 'u8' && (Buffer.isBuffer(value) || Array.isArray(value))) {
       const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      // Reject length mismatch: silent truncation/zero-padding would produce a
+      // valid-looking but WRONG fixed array (e.g. a wrong-length pubkey).
+      if (buf.length !== size) {
+        throw new Error(`Fixed array length mismatch: expected ${size} bytes, got ${buf.length}`);
+      }
       const result = Buffer.alloc(size);
-      buf.copy(result, 0, 0, Math.min(buf.length, size));
+      buf.copy(result, 0, 0, size);
       return result;
     }
     const bufs = [];
