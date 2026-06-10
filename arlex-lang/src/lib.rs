@@ -296,7 +296,7 @@ impl<T: ArgsDeserialize> ArgsDeserialize for Option<T> {
 }
 
 // ============================================================
-// Borrow-flag engagement helper (FINDING 1 — aliasing &mut prevention)
+// RAII account guards (FINDING 1 — aliasing &mut prevention, CPI-compatible)
 //
 // Background: pinocchio's `AccountView::check_borrow_mut()` only READS the
 // borrow flag (returns Ok if the flag == NOT_BORROWED) and never mutates it.
@@ -305,26 +305,36 @@ impl<T: ArgsDeserialize> ArgsDeserialize for Option<T> {
 // account both passed the read-only check, producing two live `&mut Self`
 // aliasing the same memory — undefined behavior.
 //
-// Fix (mut path only): `try_borrow_mut()` actually engages the flag (sets
-// borrow_state = 0) and returns a `RefMut` whose `Drop` would restore
-// NOT_BORROWED. We engage the flag and then `mem::forget` the guard, so the
-// flag stays engaged for the remainder of the instruction. A second mutable
-// engagement of the SAME account then fails (`try_borrow_mut` re-checks the
-// flag and sees it is not NOT_BORROWED), while engaging a DIFFERENT account
-// succeeds (its flag is independent). The Solana runtime resets all borrow
-// flags at instruction entry, so "engage and never release" is correct
-// per-instruction and needs no RAII guard at the call site — the public
-// return type stays `&mut Self`. This closes the real UB: two live `&mut Self`.
+// Fix (mut path only): `try_borrow_mut()` actually ENGAGES the flag (sets
+// borrow_state = 0) and returns a `RefMut` whose real `Drop` restores
+// NOT_BORROWED. We KEEP that guard alive (no `mem::forget`) by wrapping it in
+// `AccountRefMut`, which exposes the account struct via `Deref`/`DerefMut`.
+// While the guard is live the flag stays engaged, so a second `load_mut` of
+// the SAME account fails (`try_borrow_mut` re-checks and sees the flag is not
+// NOT_BORROWED) — this closes the aliasing `&mut`/`&mut` UB. A `load_mut` of a
+// DIFFERENT account succeeds (its flag is independent).
+//
+// CPI compatibility (why this REPLACES engage-and-forget): a handler that
+// loads an account mutably and later passes that SAME account into a CPI — as
+// a PDA signer or a writable account — needs the borrow flag RELEASED before
+// the CPI. The checked CPI invoke rejects a read-only account that is mutably
+// borrowed and a writable account that is borrowed in any form. The previous
+// `engage_borrow_mut` leaked the guard via `mem::forget`, so the flag stayed
+// engaged for the whole instruction and that CPI failed with
+// AccountBorrowFailed at runtime (bricking the PDA-as-CPI-signer pattern used
+// by token-vault::withdraw and the contracts' PDA-authority transfers). With
+// an RAII guard the handler simply drops (or scopes) the guard — copying out
+// any needed fields/bump first — before the CPI, and the flag is restored.
 //
 // Read path is deliberately NON-engaging. The generated immutable `load` uses
 // the read-only `check_borrow` (verifies the account is not currently mutably
-// borrowed but does NOT engage the flag). Engaging the read path would leak a
-// shared-borrow decrement and make a subsequent `load_mut` of the SAME account
-// fail with AccountBorrowFailed, breaking the legitimate
-// read-then-mutate-same-account pattern (used by several native-dex handlers:
-// add_liquidity, zap_liquidity, compress_liquidity, grow_liquidity,
+// borrowed but does NOT engage the flag) and returns `&'a Self`. Engaging the
+// read path would leak a shared-borrow decrement and make a subsequent
+// `load_mut` of the SAME account fail with AccountBorrowFailed, breaking the
+// legitimate read-then-mutate-same-account pattern (used by several native-dex
+// handlers: add_liquidity, zap_liquidity, compress_liquidity, grow_liquidity,
 // compound_yield on pool_state, and the master-pool swap). So `load` does not
-// engage.
+// engage and must NOT be converted to an engaging guard.
 //
 // Documented residual: an immutable ref returned by `load` that is held live
 // across a `load_mut` of the same account is the same `&T` / `&mut T` window
@@ -332,30 +342,76 @@ impl<T: ArgsDeserialize> ArgsDeserialize for Option<T> {
 // case — two `&mut T` aliasing the same account — is what this fix closes.
 // ============================================================
 
-/// Engage the mutable borrow flag on `account` for the rest of the
-/// instruction and return a raw pointer to its data region.
+/// RAII guard returned by generated `load_mut`/`init`.
 ///
-/// Returns `Err(ProgramError::AccountBorrowFailed)` if the account is already
-/// borrowed (mutably or immutably) — this is what makes a second `load_mut`
-/// of the same account fail instead of producing an aliasing `&mut`.
+/// Holds the live pinocchio `RefMut<[u8]>` obtained from
+/// `AccountView::try_borrow_mut()` (which engaged the mutable borrow flag,
+/// setting `borrow_state = 0`) together with a typed pointer into the account
+/// data past the 8-byte discriminator. The account struct `T` is reached via
+/// `Deref`/`DerefMut`, so `guard.field` reads and writes work transparently.
 ///
-/// The returned pointer is to the start of the account data (offset 0). The
-/// caller is responsible for advancing past the 8-byte discriminator.
+/// When the guard is dropped, the held `RefMut`'s `Drop` restores the borrow
+/// flag to `NOT_BORROWED`. This is what lets a handler do a subsequent CPI on
+/// the SAME account (as a PDA signer or writable account) after scoping/copying
+/// out of the guard — the checked CPI invoke requires the flag released.
 ///
-/// # Safety
-/// The borrow flag stays engaged until instruction exit (the guard is
-/// intentionally leaked via `core::mem::forget`). This is sound because the
-/// runtime resets borrow flags at every instruction entry.
+/// While the guard is live, a second `load_mut` (or `try_account_ref_mut`) of
+/// the same account fails with `AccountBorrowFailed`, preserving FINDING-1's
+/// anti-aliasing guarantee.
+pub struct AccountRefMut<'a, T> {
+    /// Live borrow guard: its `Drop` resets `borrow_state` to NOT_BORROWED.
+    /// Kept private; only its lifetime/Drop matter to callers.
+    _guard: pinocchio::account::RefMut<'a, [u8]>,
+    /// Typed pointer into account data, past the 8-byte discriminator.
+    /// Valid for as long as `_guard` is held (it pins the borrow).
+    ptr: *mut T,
+}
+
+impl<'a, T> core::ops::Deref for AccountRefMut<'a, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // Safety: `ptr` points into the account data region, which `_guard`
+        // keeps exclusively borrowed for the lifetime of `self`. The account
+        // is repr(C, packed) (alignment 1), so the pointer is always aligned.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<'a, T> core::ops::DerefMut for AccountRefMut<'a, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // Safety: exclusive access is guaranteed by the engaged mutable borrow
+        // held in `_guard`; `&mut self` ensures no other reference exists.
+        unsafe { &mut *self.ptr }
+    }
+}
+
+/// Construct an [`AccountRefMut`] for an account's data at `data_offset`.
+///
+/// Engages the mutable borrow flag via `AccountView::try_borrow_mut()`
+/// (setting `borrow_state = 0`); returns `Err(ProgramError::AccountBorrowFailed)`
+/// if the account is already borrowed in any form. This is what makes a second
+/// mutable load of the SAME account fail instead of producing an aliasing
+/// `&mut` (FINDING-1 closure stays intact while the guard is live).
+///
+/// `data_offset` is the byte offset of the typed struct within the account
+/// data; the generated codegen passes `8` to skip the discriminator.
+///
+/// Unlike the removed `engage_borrow_mut`, the borrow guard is NOT leaked: it
+/// is held inside the returned `AccountRefMut` and its `Drop` restores the flag
+/// to NOT_BORROWED, so a later CPI on the same account succeeds once the guard
+/// is dropped/scoped.
 #[inline]
-pub fn engage_borrow_mut(account: &AccountView) -> core::result::Result<*mut u8, ProgramError> {
-    // try_borrow_mut() re-checks the flag and engages it (borrow_state = 0).
-    // Fails if the account is already borrowed in any form.
+pub fn try_account_ref_mut<T>(
+    account: &AccountView,
+    data_offset: usize,
+) -> core::result::Result<AccountRefMut<'_, T>, ProgramError> {
+    // Engages the flag (state = 0); fails if already borrowed in any form.
     let guard = account.try_borrow_mut()?;
-    // Leak the guard so the flag stays engaged for the rest of the instruction.
-    // Without this, Drop would restore NOT_BORROWED and a second load_mut would
-    // succeed, re-opening the aliasing window.
-    core::mem::forget(guard);
-    Ok(account.data_ptr())
+    // Typed pointer past the discriminator. `data_ptr()` is the data start.
+    let ptr = unsafe { account.data_ptr().add(data_offset) as *mut T };
+    Ok(AccountRefMut { _guard: guard, ptr })
 }
 
 // ============================================================
@@ -800,37 +856,43 @@ mod tests {
     }
 
     #[test]
-    fn test_engage_borrow_mut_second_engage_fails() {
+    fn test_account_ref_mut_second_engage_fails() {
         let mut acct = FakeAccount::new();
         let view = unsafe { acct.view() };
 
-        // First engagement succeeds and engages the flag.
-        let p1 = engage_borrow_mut(&view).expect("first engage_borrow_mut must succeed");
-        assert!(!p1.is_null());
+        // First guard succeeds and engages the flag.
+        let g1 = try_account_ref_mut::<u8>(&view, 8)
+            .expect("first try_account_ref_mut must succeed");
 
-        // Second engagement of the SAME account must fail while the first is
-        // live — this is the core anti-aliasing guarantee.
+        // Second guard of the SAME account must fail while the first is LIVE —
+        // this is the core anti-aliasing guarantee (FINDING-1 closure).
         assert!(
-            engage_borrow_mut(&view).is_err(),
-            "second engage_borrow_mut of same account must fail"
+            try_account_ref_mut::<u8>(&view, 8).is_err(),
+            "second try_account_ref_mut of same account must fail while first guard is live"
         );
+
+        // Keep the first guard alive until after the second attempt.
+        let _ = g1;
     }
 
     #[test]
-    fn test_engage_borrow_mut_two_different_accounts_succeed() {
+    fn test_account_ref_mut_two_different_accounts_succeed() {
         let mut a = FakeAccount::new();
         let mut b = FakeAccount::new();
         let view_a = unsafe { a.view() };
         let view_b = unsafe { b.view() };
 
-        // Different accounts have independent flags — both must succeed
-        // (swap.rs holds two different accounts' mut handles live).
-        assert!(engage_borrow_mut(&view_a).is_ok());
-        assert!(engage_borrow_mut(&view_b).is_ok());
+        // Different accounts have independent flags — both must succeed even
+        // while both guards are live (swap.rs holds two different accounts'
+        // mut handles live simultaneously).
+        let ga = try_account_ref_mut::<u8>(&view_a, 8);
+        let gb = try_account_ref_mut::<u8>(&view_b, 8);
+        assert!(ga.is_ok());
+        assert!(gb.is_ok());
     }
 
     #[test]
-    fn test_read_check_then_engage_borrow_mut_same_account_succeeds() {
+    fn test_read_check_then_account_ref_mut_same_account_succeeds() {
         let mut acct = FakeAccount::new();
         let view = unsafe { acct.view() };
 
@@ -839,20 +901,16 @@ mod tests {
         // The generated immutable `load` uses the NON-ENGAGING read-only
         // borrow check (`check_borrow`), which only verifies the account is not
         // currently mutably borrowed and does NOT engage the flag. Replicate
-        // exactly what `load` does, then engage the mutable borrow on the SAME
+        // exactly what `load` does, then build the mutable guard on the SAME
         // account (what a following `load_mut` does). It MUST succeed — this is
         // the legitimate read-then-mutate-same-account pattern used by several
         // native-dex handlers (add_liquidity, zap_liquidity, compress_liquidity,
         // grow_liquidity, compound_yield on pool_state, master-pool swap).
-        //
-        // Before the read-path was reverted to non-engaging, `load` engaged a
-        // shared borrow and leaked a decrement, so this `engage_borrow_mut`
-        // failed with AccountBorrowFailed at runtime (the regression).
         view.check_borrow()
             .expect("non-engaging read check must succeed on a fresh account");
-        let p = engage_borrow_mut(&view)
-            .expect("engage_borrow_mut after a non-engaging read check of the SAME account must succeed");
-        assert!(!p.is_null());
+        let g = try_account_ref_mut::<u8>(&view, 8)
+            .expect("try_account_ref_mut after a non-engaging read check of the SAME account must succeed");
+        let _ = g;
     }
 
     // ---- L4: real native PDA derivation (sha256 fake removed) ----
