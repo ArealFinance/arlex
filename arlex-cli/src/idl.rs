@@ -604,12 +604,33 @@ fn parse_account_attr_flags(attr: &str) -> (bool, bool) {
     (is_mut, is_signer)
 }
 
+/// Decide whether a stripped, trimmed line inside an `#[error_code]` enum is a
+/// variant declaration. A variant is any line that starts with an identifier
+/// character (letter or `_`), regardless of leading case, and is not the
+/// `pub enum` header, an attribute, a brace, or empty. This counts every real
+/// variant structurally so IDL codes align with the runtime's 6000 + index.
+fn is_error_variant_line(st: &str) -> bool {
+    if st.is_empty() || st == "{" || st == "}" {
+        return false;
+    }
+    if st.starts_with('#') {
+        return false; // attribute
+    }
+    // Skip the enum header (`pub enum Name {`) and any visibility/keyword lines.
+    if st.starts_with("pub enum") || st.starts_with("enum ") {
+        return false;
+    }
+    // A variant name begins with an ASCII letter or underscore.
+    matches!(st.as_bytes().first(), Some(b) if b.is_ascii_alphabetic() || *b == b'_')
+}
+
 fn parse_errors(source: &str, idl: &mut Idl) {
     let mut in_error = false;
     let mut depth = 0i32;
-    let mut code: u32 = 6000;
+    let mut variant_index: u32 = 0; // STRUCTURAL position; code = 6000 + index
     let mut next_msg = String::new();
     let mut in_block_comment = false;
+    let errors_before = idl.errors.len();
 
     for line in source.lines() {
         let t = line.trim();
@@ -618,7 +639,12 @@ fn parse_errors(source: &str, idl: &mut Idl) {
             continue;
         }
         if in_error {
-            depth += brace_delta(line, &mut in_block_comment);
+            // Strip literals/comments ONCE per line; derive both brace depth
+            // and variant detection from the same stripped text so a brace
+            // inside a literal can't confuse either.
+            let stripped = strip_literals_and_comments(line, &mut in_block_comment);
+            depth += stripped.matches('{').count() as i32 - stripped.matches('}').count() as i32;
+
             if t.starts_with("#[msg(") {
                 next_msg = t
                     .strip_prefix("#[msg(\"")
@@ -627,16 +653,19 @@ fn parse_errors(source: &str, idl: &mut Idl) {
                     .unwrap_or("")
                     .to_string();
             }
-            if !t.starts_with('#')
-                && !t.starts_with("pub enum")
-                && !t.is_empty()
-                && t != "{"
-                && t != "}"
-                && t.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-            {
-                let vname = t.trim_end_matches(',').to_string();
+
+            // FINDING 3 (IDL side): count EVERY enum variant structurally so the
+            // IDL code matches the runtime's `6000 + structural index`. The old
+            // logic only counted lines whose first char was uppercase, so a
+            // lowercase-leading variant was skipped and misaligned every later
+            // code. The variant name comes from the original trimmed line (the
+            // stripped one preserves identifiers as code, so either works, but
+            // the original keeps non-ASCII identifier bytes intact).
+            let st = stripped.trim();
+            if is_error_variant_line(st) {
+                let vname = t.trim_end_matches(',').trim().to_string();
                 idl.errors.push(IdlError {
-                    code,
+                    code: 6000 + variant_index,
                     name: vname.clone(),
                     msg: if next_msg.is_empty() {
                         vname
@@ -644,13 +673,21 @@ fn parse_errors(source: &str, idl: &mut Idl) {
                         std::mem::take(&mut next_msg)
                     },
                 });
-                code += 1;
+                variant_index += 1;
             }
             if depth <= 0 {
                 in_error = false;
             }
         }
     }
+
+    // Cross-check: the number of IDL errors emitted for this enum must equal
+    // the number of variants structurally counted.
+    debug_assert_eq!(
+        idl.errors.len() - errors_before,
+        variant_index as usize,
+        "error variant count mismatch"
+    );
 }
 
 fn parse_events(source: &str, idl: &mut Idl) {
@@ -1203,6 +1240,66 @@ pub enum MyError {
         assert_eq!(idl.errors[2].code, 6002);
         assert_eq!(idl.errors[2].name, "Overflow");
         assert_eq!(idl.errors[2].msg, "Overflow"); // no #[msg] → name as msg
+    }
+
+    // ==================== FINDING 3 (IDL side): structural error indexing ====================
+
+    #[test]
+    fn test_parse_errors_lowercase_variant_keeps_codes_aligned() {
+        // A lowercase-leading variant (unconventional but valid Rust) must be
+        // counted structurally so later codes stay aligned with the runtime's
+        // 6000 + position. The old uppercase-only counter would skip `lower`
+        // and shift `Third` to 6001 instead of the correct 6002.
+        let source = r#"
+#[error_code]
+pub enum MixedCase {
+    First,
+    lower,
+    Third,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_errors(source, &mut idl);
+        assert_eq!(idl.errors.len(), 3, "every variant counted structurally");
+        assert_eq!(idl.errors[0].name, "First");
+        assert_eq!(idl.errors[0].code, 6000);
+        assert_eq!(idl.errors[1].name, "lower");
+        assert_eq!(idl.errors[1].code, 6001);
+        assert_eq!(idl.errors[2].name, "Third");
+        assert_eq!(idl.errors[2].code, 6002, "Third must be 6002, not 6001");
+    }
+
+    #[test]
+    fn test_parse_errors_counts_all_variants() {
+        let source = r#"
+#[error_code]
+pub enum Errs {
+    A,
+    b,
+    C,
+    d,
+    E,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_errors(source, &mut idl);
+        assert_eq!(idl.errors.len(), 5, "all five variants counted");
+        // Codes are dense and structural: 6000..=6004.
+        for (i, e) in idl.errors.iter().enumerate() {
+            assert_eq!(e.code, 6000 + i as u32);
+        }
+    }
+
+    #[test]
+    fn test_is_error_variant_line_excludes_non_variants() {
+        assert!(is_error_variant_line("First,"));
+        assert!(is_error_variant_line("lower,"));
+        assert!(is_error_variant_line("_Hidden,"));
+        assert!(!is_error_variant_line("#[msg(\"x\")]"));
+        assert!(!is_error_variant_line("pub enum Foo {"));
+        assert!(!is_error_variant_line("{"));
+        assert!(!is_error_variant_line("}"));
+        assert!(!is_error_variant_line(""));
     }
 
     #[test]
