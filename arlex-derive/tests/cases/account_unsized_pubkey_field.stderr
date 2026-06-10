@@ -1,0 +1,11 @@
+error: cannot compute size of field `other` (type `Pk`); the has_one offset table would be incomplete because a later [u8; 32] pubkey field's offset depends on it — use a concrete type with a macro-known size
+  --> tests/cases/account_unsized_pubkey_field.rs:11:16
+   |
+11 |     pub other: Pk,
+   |                ^^
+
+error[E0433]: failed to resolve: use of undeclared type `DataAccount`
+  --> tests/cases/account_unsized_pubkey_field.rs:21:56
+   |
+21 |     #[account(mut, has_one = authority, account_type = "DataAccount")]
+   |                                                        ^^^^^^^^^^^^^ use of undeclared type `DataAccount`

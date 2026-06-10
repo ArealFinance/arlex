@@ -37,11 +37,20 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
     };
 
     // Generate PUBKEY_FIELD_OFFSETS: compile-time offsets of all [u8; 32] fields
-    // Used by has_one constraint for secure field lookup (no byte-scan)
+    // Used by has_one constraint for secure field lookup (no byte-scan).
+    //
+    // FINDING 4: If a field's size cannot be computed at macro time (e.g. a
+    // type alias), offsets of all SUBSEQUENT fields are unknown. Previously the
+    // loop silently `break`ed here, dropping any later [u8; 32] pubkey field
+    // from the offset table — has_one would then find no offset and ALWAYS
+    // fail (fail-closed DoS) with no compile-time signal. Now we emit a
+    // compile_error! naming the offending field/type whenever a pubkey field
+    // follows an unsized field, instead of silently truncating.
+    let named: Vec<&syn::Field> = named_fields.iter().collect();
     let mut pubkey_offsets = Vec::new();
     let mut cumulative_offset: usize = 8; // start after 8-byte discriminator
 
-    for field in named_fields.iter() {
+    for (i, field) in named.iter().enumerate() {
         let field_name = field.ident.as_ref().unwrap().to_string();
         let field_size = type_size(&field.ty);
 
@@ -53,7 +62,28 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
         if let Some(size) = field_size {
             cumulative_offset += size;
         } else {
-            // Unknown type size — can't compute further offsets at macro time
+            // Unknown type size — offsets of later fields are not computable.
+            // If any later field is a pubkey candidate, the offset table would
+            // be incomplete: refuse to compile rather than silently truncate.
+            let has_later_pubkey = named[i + 1..]
+                .iter()
+                .any(|f| is_pubkey_field(&f.ty));
+            if has_later_pubkey {
+                let ty = &field.ty;
+                let ty_str = quote!(#ty).to_string();
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    format!(
+                        "cannot compute size of field `{}` (type `{}`); the \
+                         has_one offset table would be incomplete because a \
+                         later [u8; 32] pubkey field's offset depends on it — \
+                         use a concrete type with a macro-known size",
+                        field_name, ty_str,
+                    ),
+                ));
+            }
+            // No pubkey fields follow — the table is complete for all existing
+            // pubkey fields; safe to stop computing further offsets.
             break;
         }
     }

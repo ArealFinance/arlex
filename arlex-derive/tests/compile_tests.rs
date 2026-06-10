@@ -38,6 +38,7 @@ fn compile_tests() {
     // #[account]
     t.compile_fail("tests/cases/account_unnamed_fields.rs");
     t.compile_fail("tests/cases/account_on_enum.rs");
+    t.compile_fail("tests/cases/account_unsized_pubkey_field.rs");
 
     // #[error_code]
     t.compile_fail("tests/cases/error_code_on_struct.rs");
