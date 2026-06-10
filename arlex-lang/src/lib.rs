@@ -847,11 +847,22 @@ mod tests {
 
         /// Build an `AccountView` pointing at this account's header.
         ///
+        /// Derive the view pointer from the WHOLE `FakeAccount` allocation so
+        /// it carries provenance over the `data` region the runtime layout
+        /// places immediately after the header. Reborrowing `&mut self.header`
+        /// would narrow provenance to JUST the header bytes, and Miri (strict
+        /// provenance / Stacked Borrows) would then flag the `data` access in
+        /// `try_borrow_mut`, where `data_ptr()` reads past the header into
+        /// `data`. `RuntimeAccount` is the first field of this `#[repr(C)]`
+        /// struct, so the address is identical to `&mut self.header` — this
+        /// only widens provenance, it does not change the pointee.
+        ///
         /// # Safety
         /// The returned view borrows from `self`; the `FakeAccount` must
         /// outlive the view and not be moved while the view is in use.
         unsafe fn view(&mut self) -> AccountView {
-            AccountView::new_unchecked(&mut self.header as *mut RuntimeAccount)
+            let ptr = self as *mut FakeAccount as *mut RuntimeAccount;
+            AccountView::new_unchecked(ptr)
         }
     }
 
