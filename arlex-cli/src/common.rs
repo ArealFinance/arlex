@@ -64,14 +64,32 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate Solana address format (base58, 32-44 chars)
+/// Validate a Solana address: base58 that decodes to exactly 32 bytes.
+///
+/// The char-length (32-44) and base58-alphabet checks are kept as fast-fail
+/// pre-checks, but they are not sufficient — a 32-char base58 string such as
+/// `"A".repeat(32)` decodes to only 24 bytes and is NOT a valid 32-byte address.
+/// The authoritative check decodes the string and requires exactly 32 bytes.
 pub fn validate_address(addr: &str) -> Result<(), String> {
+    // Fast-fail pre-checks (cheap, reject obvious garbage before decoding).
     if addr.len() < 32 || addr.len() > 44 {
         return Err("Invalid Solana address length (expected 32-44 chars)".into());
     }
     const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     if !addr.bytes().all(|b| BASE58.contains(&b)) {
         return Err("Invalid base58 characters in address".into());
+    }
+
+    // Authoritative check: decode and require exactly 32 bytes. `into_vec`
+    // returns a Result and must NOT panic on malformed input.
+    let decoded = bs58::decode(addr)
+        .into_vec()
+        .map_err(|e| format!("Address is not valid base58: {}", e))?;
+    if decoded.len() != 32 {
+        return Err(format!(
+            "Invalid Solana address: decodes to {} bytes, expected exactly 32",
+            decoded.len()
+        ));
     }
     Ok(())
 }
@@ -166,8 +184,35 @@ mod tests {
 
     #[test]
     fn test_valid_addresses() {
+        // Real addresses that decode to exactly 32 bytes.
+        assert!(validate_address("So11111111111111111111111111111111111111112").is_ok());
         assert!(validate_address("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").is_ok());
+        // 32 zero bytes (System Program) — 32 chars, decodes to 32 bytes.
         assert!(validate_address("11111111111111111111111111111111").is_ok());
+    }
+
+    #[test]
+    fn test_address_decodes_to_wrong_byte_length_rejected() {
+        // A base58 string that decodes to 31 bytes must be rejected. Build one
+        // by encoding exactly 31 bytes.
+        let thirty_one = bs58::encode(&[1u8; 31]).into_string();
+        assert!(
+            validate_address(&thirty_one).is_err(),
+            "31-byte decode must be rejected"
+        );
+        // A base58 string that decodes to 33 bytes must be rejected.
+        let thirty_three = bs58::encode(&[1u8; 33]).into_string();
+        assert!(
+            validate_address(&thirty_three).is_err(),
+            "33-byte decode must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_address_non_base58_is_err_no_panic() {
+        // '0', 'O', 'I', 'l' are not in the base58 alphabet — the alphabet
+        // pre-check rejects this, and decoding never panics regardless.
+        assert!(validate_address("0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl").is_err());
     }
 
     #[test]
@@ -318,11 +363,18 @@ mod tests {
 
     #[test]
     fn test_address_boundary_32_chars() {
-        assert!(validate_address(&"A".repeat(32)).is_ok());
+        // Characterizes the CORRECTED (stricter) byte-count behavior: a 32-char
+        // base58 string of all 'A' decodes to only 24 bytes, not 32, so it must
+        // now be REJECTED. The old char-only check wrongly accepted it.
+        assert!(validate_address(&"A".repeat(32)).is_err());
     }
 
     #[test]
     fn test_address_boundary_44_chars() {
+        // Characterizes byte-count semantics: a 44-char string of all 'A'
+        // decodes to exactly 32 bytes, so it remains accepted — but now because
+        // the decoded length is 32, not merely because the char count is in
+        // range.
         assert!(validate_address(&"A".repeat(44)).is_ok());
     }
 
