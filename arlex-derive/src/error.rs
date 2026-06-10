@@ -17,6 +17,19 @@ pub fn generate(input: ItemEnum) -> Result<TokenStream> {
 
     for (i, variant) in variants.iter().enumerate() {
         let var_name = &variant.ident;
+
+        // FINDING 3 (macro side): error codes are assigned as 6000 + structural
+        // position. An explicit discriminant (e.g. `Beta = 99`) or a non-unit
+        // variant (one with fields) would silently corrupt the IDL <-> runtime
+        // mapping, so reject both at compile time.
+        if variant.discriminant.is_some() || !matches!(variant.fields, syn::Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                variant,
+                "error_code variants must be unit variants without explicit \
+                 discriminants (codes are assigned 6000 + position)",
+            ));
+        }
+
         let code = base_code + i as u32;
 
         // Extract #[msg("...")] attribute

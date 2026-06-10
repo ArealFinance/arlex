@@ -42,6 +42,8 @@ fn compile_tests() {
 
     // #[error_code]
     t.compile_fail("tests/cases/error_code_on_struct.rs");
+    t.compile_fail("tests/cases/error_code_explicit_discriminant.rs");
+    t.compile_fail("tests/cases/error_code_non_unit_variant.rs");
 
     // #[event]
     t.compile_fail("tests/cases/event_unnamed_fields.rs");
