@@ -404,29 +404,22 @@ pub fn write_u32_le(data: &mut [u8], offset: usize, val: u32) {
 // ============================================================
 
 /// Find a Program Derived Address.
-/// On SBF: uses the native syscall.
-/// On native: uses the sha256-based derivation for IDE/check compatibility.
-#[cfg(any(target_os = "solana", target_arch = "bpf"))]
+///
+/// This delegates UNCONDITIONALLY to `solana_address::Address::find_program_address`
+/// (the type pinocchio re-exports as `Address`):
+/// - On SBF (`target_os = "solana"` / `target_arch = "bpf"`) it resolves to the
+///   `sol_try_find_program_address` syscall.
+/// - On native it resolves to the real off-chain canonical-bump loop with a
+///   genuine ed25519 off-curve check (curve25519-dalek), enabled by the
+///   native-only `solana-address = { features = ["curve25519"] }` dependency in
+///   Cargo.toml. The result is a CANONICAL PDA — identical to what the runtime
+///   derives — so host `cargo test` validates REAL PDAs, not a fake.
+///
+/// Previously the native branch used a sha256 stub that returned a non-canonical
+/// bump of 255 and an address that did not match the syscall's output; that fake
+/// has been removed.
 pub fn find_program_address(seeds: &[&[u8]], program_id: &Address) -> (Address, u8) {
     Address::find_program_address(seeds, program_id)
-}
-
-#[cfg(not(any(target_os = "solana", target_arch = "bpf")))]
-pub fn find_program_address(seeds: &[&[u8]], _program_id: &Address) -> (Address, u8) {
-    // Native-target implementation for cargo check and IDE support.
-    // Uses sha256-based derivation. On SBF target, the real Solana syscall is used instead.
-    // This is NOT a stub — it produces deterministic addresses for development/testing.
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    for seed in seeds {
-        hasher.update(seed);
-    }
-    hasher.update(_program_id.as_ref());
-    hasher.update(b"ProgramDerivedAddress");
-    let hash = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&hash[..32]);
-    (Address::new_from_array(bytes), 255)
 }
 
 /// Create a PDA account via System Program CPI.
@@ -466,8 +459,12 @@ pub fn create_pda_account<'a>(
     _signer_seeds: &[&[u8]],
     _all_accounts: &[AccountView],
 ) -> core::result::Result<(), ProgramError> {
-    // Native-target implementation — returns Ok(()) for cargo check/IDE.
-    // On SBF target, the real System Program CPI is used instead.
+    // Legitimate host no-op: there is no Solana runtime off-chain, so a CPI
+    // cannot execute. This returns Ok(()) so `cargo check`/IDE/host tests
+    // compile and run; on the SBF target the real System Program CPI above is
+    // used. This is NOT a fake value (unlike the old sha256 find_program_address
+    // stub that has been removed) — it is the absence of a side effect that has
+    // no host equivalent. Do not "fix" this to fabricate account creation.
     Ok(())
 }
 
@@ -856,6 +853,83 @@ mod tests {
         let p = engage_borrow_mut(&view)
             .expect("engage_borrow_mut after a non-engaging read check of the SAME account must succeed");
         assert!(!p.is_null());
+    }
+
+    // ---- L4: real native PDA derivation (sha256 fake removed) ----
+    //
+    // These validate that `find_program_address` on the HOST now produces a
+    // canonical, off-curve PDA identical to the runtime's — not the old sha256
+    // stub that always returned bump 255 and a fabricated address. The proofs
+    // use `Address::create_program_address` (the real off-chain ed25519 check,
+    // available via the native-only `curve25519` feature) for the round-trip.
+
+    /// A fixed seed + program_id derives a canonical bump: re-deriving with
+    /// `create_program_address(seeds ++ [bump], program_id)` reproduces the
+    /// SAME address. The old sha256 fake would fail this round-trip.
+    #[test]
+    fn test_find_program_address_canonical_roundtrip() {
+        let program_id = Address::new_from_array([7u8; 32]);
+        let (pda, bump) = find_program_address(&[b"vault", b"areal"], &program_id);
+
+        let reproduced = Address::create_program_address(
+            &[b"vault", b"areal", &[bump]],
+            &program_id,
+        )
+        .expect("canonical bump must produce a valid PDA on round-trip");
+        assert_eq!(pda, reproduced, "round-trip must reproduce the same PDA");
+    }
+
+    /// The derived PDA must be OFF the ed25519 curve (the defining property of a
+    /// real PDA). `is_on_curve` is available via the native-only curve25519
+    /// feature; the sha256 fake never checked this.
+    #[test]
+    fn test_find_program_address_is_off_curve() {
+        let program_id = Address::new_from_array([3u8; 32]);
+        let (pda, _bump) = find_program_address(&[b"config"], &program_id);
+        assert!(!pda.is_on_curve(), "a real PDA must be off the ed25519 curve");
+    }
+
+    /// The canonical bump for a typical seed is generally NOT 255 (the old fake
+    /// always returned 255). Combined with the round-trip, this proves real
+    /// derivation. We assert the round-trip holds for whatever the canonical
+    /// bump is, and that at least one of a few fixed seeds yields bump != 255.
+    #[test]
+    fn test_find_program_address_bump_is_canonical_not_always_255() {
+        let program_id = Address::new_from_array([42u8; 32]);
+        let seeds_list: [&[&[u8]]; 4] = [
+            &[b"a"],
+            &[b"pool"],
+            &[b"strwt", b"mint"],
+            &[b"areal", b"vault", b"v1"],
+        ];
+        let mut any_non_255 = false;
+        for seeds in seeds_list {
+            let (pda, bump) = find_program_address(seeds, &program_id);
+            // Round-trip every derivation regardless of bump value.
+            let mut with_bump: Vec<&[u8]> = seeds.to_vec();
+            let bump_arr = [bump];
+            with_bump.push(&bump_arr);
+            let reproduced = Address::create_program_address(&with_bump, &program_id)
+                .expect("canonical bump must round-trip");
+            assert_eq!(pda, reproduced);
+            if bump != 255 {
+                any_non_255 = true;
+            }
+        }
+        assert!(
+            any_non_255,
+            "at least one typical seed should yield a canonical bump != 255 \
+             (the old sha256 fake always returned 255)"
+        );
+    }
+
+    /// Two different seeds derive two different addresses.
+    #[test]
+    fn test_find_program_address_distinct_seeds_distinct_addresses() {
+        let program_id = Address::new_from_array([9u8; 32]);
+        let (pda_a, _) = find_program_address(&[b"alpha"], &program_id);
+        let (pda_b, _) = find_program_address(&[b"beta"], &program_id);
+        assert_ne!(pda_a, pda_b, "different seeds must yield different PDAs");
     }
 
     // ---- Gap 1: u128/i128 ArgsDeserialize ----

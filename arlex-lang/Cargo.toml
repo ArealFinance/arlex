@@ -13,4 +13,14 @@ pinocchio-system = "0.5"
 pinocchio-associated-token-account = "0.3"
 pinocchio-memo = "0.3"
 solana-program-log = "1.1"
-sha2 = "0.10"
+
+# Native-only: activate the `curve25519` feature on the same `solana-address`
+# instance pinocchio re-exports as `Address`. Cargo feature unification merges
+# this with pinocchio's `solana-address` (which only enables "syscalls"), so on
+# the host `Address::find_program_address` resolves to the REAL canonical-bump
+# loop with a genuine ed25519 off-curve check (via curve25519-dalek) instead of
+# a fake. `curve25519-dalek` is gated `cfg(not(any(target_os = "solana",
+# target_arch = "bpf")))` inside solana-address, so it never enters the SBF
+# artifact — on SBF `find_program_address` resolves to the syscall.
+[target.'cfg(not(any(target_os = "solana", target_arch = "bpf")))'.dependencies]
+solana-address = { version = "2", features = ["curve25519"] }
