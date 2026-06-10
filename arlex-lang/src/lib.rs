@@ -296,7 +296,7 @@ impl<T: ArgsDeserialize> ArgsDeserialize for Option<T> {
 }
 
 // ============================================================
-// Borrow-flag engagement helpers (FINDING 1 — aliasing &mut prevention)
+// Borrow-flag engagement helper (FINDING 1 — aliasing &mut prevention)
 //
 // Background: pinocchio's `AccountView::check_borrow_mut()` only READS the
 // borrow flag (returns Ok if the flag == NOT_BORROWED) and never mutates it.
@@ -305,15 +305,31 @@ impl<T: ArgsDeserialize> ArgsDeserialize for Option<T> {
 // account both passed the read-only check, producing two live `&mut Self`
 // aliasing the same memory — undefined behavior.
 //
-// Fix: `try_borrow_mut()` actually engages the flag (sets borrow_state = 0)
-// and returns a `RefMut` whose `Drop` would restore NOT_BORROWED. We engage
-// the flag and then `mem::forget` the guard, so the flag stays engaged for
-// the remainder of the instruction. A second engagement of the SAME account
-// then fails (`try_borrow_mut` re-checks the flag and sees it is not
-// NOT_BORROWED), while engaging a DIFFERENT account succeeds (its flag is
-// independent). The Solana runtime resets all borrow flags at instruction
-// entry, so "engage and never release" is correct per-instruction and needs
-// no RAII guard at the call site — the public return type stays `&mut Self`.
+// Fix (mut path only): `try_borrow_mut()` actually engages the flag (sets
+// borrow_state = 0) and returns a `RefMut` whose `Drop` would restore
+// NOT_BORROWED. We engage the flag and then `mem::forget` the guard, so the
+// flag stays engaged for the remainder of the instruction. A second mutable
+// engagement of the SAME account then fails (`try_borrow_mut` re-checks the
+// flag and sees it is not NOT_BORROWED), while engaging a DIFFERENT account
+// succeeds (its flag is independent). The Solana runtime resets all borrow
+// flags at instruction entry, so "engage and never release" is correct
+// per-instruction and needs no RAII guard at the call site — the public
+// return type stays `&mut Self`. This closes the real UB: two live `&mut Self`.
+//
+// Read path is deliberately NON-engaging. The generated immutable `load` uses
+// the read-only `check_borrow` (verifies the account is not currently mutably
+// borrowed but does NOT engage the flag). Engaging the read path would leak a
+// shared-borrow decrement and make a subsequent `load_mut` of the SAME account
+// fail with AccountBorrowFailed, breaking the legitimate
+// read-then-mutate-same-account pattern (used by several native-dex handlers:
+// add_liquidity, zap_liquidity, compress_liquidity, grow_liquidity,
+// compound_yield on pool_state, and the master-pool swap). So `load` does not
+// engage.
+//
+// Documented residual: an immutable ref returned by `load` that is held live
+// across a `load_mut` of the same account is the same `&T` / `&mut T` window
+// that existed before this fix and is the accepted tradeoff. The dangerous
+// case — two `&mut T` aliasing the same account — is what this fix closes.
 // ============================================================
 
 /// Engage the mutable borrow flag on `account` for the rest of the
@@ -340,33 +356,6 @@ pub fn engage_borrow_mut(account: &AccountView) -> core::result::Result<*mut u8,
     // succeed, re-opening the aliasing window.
     core::mem::forget(guard);
     Ok(account.data_ptr())
-}
-
-/// Engage a shared (immutable) borrow on `account` for the rest of the
-/// instruction and return a raw pointer to its data region.
-///
-/// Returns `Err(ProgramError::AccountBorrowFailed)` if the account is already
-/// mutably borrowed. Multiple shared engagements of the same account succeed
-/// (the immutable borrow counter starts at NOT_BORROWED = 255 and is
-/// decremented per engagement), so legitimate multiple immutable reads of the
-/// same account keep working. A shared engagement after a mutable engagement
-/// (or vice versa) of the same account fails, as required.
-///
-/// Note: because each engagement leaks one decrement of the immutable borrow
-/// counter, the same account can be immutably engaged at most 253 times in a
-/// single instruction before the counter floor is reached. This is far beyond
-/// any realistic instruction's read count.
-///
-/// # Safety
-/// Same as [`engage_borrow_mut`]: the borrow is intentionally leaked and the
-/// runtime resets borrow flags at instruction entry.
-#[inline]
-pub fn engage_borrow(account: &AccountView) -> core::result::Result<*const u8, ProgramError> {
-    // try_borrow() re-checks the flag and engages a shared borrow.
-    // Fails if the account is already mutably borrowed.
-    let guard = account.try_borrow()?;
-    core::mem::forget(guard);
-    Ok(account.data_ptr() as *const u8)
 }
 
 // ============================================================
@@ -844,45 +833,29 @@ mod tests {
     }
 
     #[test]
-    fn test_engage_borrow_then_borrow_mut_same_account_fails() {
+    fn test_read_check_then_engage_borrow_mut_same_account_succeeds() {
         let mut acct = FakeAccount::new();
         let view = unsafe { acct.view() };
 
-        // Shared engagement first, then mutable engagement of the same account
-        // must fail (load_mut after load).
-        assert!(engage_borrow(&view).is_ok());
-        assert!(
-            engage_borrow_mut(&view).is_err(),
-            "engage_borrow_mut after engage_borrow of same account must fail"
-        );
-    }
-
-    #[test]
-    fn test_engage_borrow_mut_then_borrow_same_account_fails() {
-        let mut acct = FakeAccount::new();
-        let view = unsafe { acct.view() };
-
-        // Mutable engagement first, then shared engagement of the same account
-        // must fail (load after load_mut).
-        assert!(engage_borrow_mut(&view).is_ok());
-        assert!(
-            engage_borrow(&view).is_err(),
-            "engage_borrow after engage_borrow_mut of same account must fail"
-        );
-    }
-
-    #[test]
-    fn test_multiple_shared_engages_same_account_succeed() {
-        let mut acct = FakeAccount::new();
-        let view = unsafe { acct.view() };
-
-        // Multiple immutable reads of the SAME account must keep working.
-        for _ in 0..16 {
-            assert!(
-                engage_borrow(&view).is_ok(),
-                "repeated engage_borrow of same account must succeed"
-            );
-        }
+        // REGRESSION TEST for the read-then-mutate-same-account bug.
+        //
+        // The generated immutable `load` uses the NON-ENGAGING read-only
+        // borrow check (`check_borrow`), which only verifies the account is not
+        // currently mutably borrowed and does NOT engage the flag. Replicate
+        // exactly what `load` does, then engage the mutable borrow on the SAME
+        // account (what a following `load_mut` does). It MUST succeed — this is
+        // the legitimate read-then-mutate-same-account pattern used by several
+        // native-dex handlers (add_liquidity, zap_liquidity, compress_liquidity,
+        // grow_liquidity, compound_yield on pool_state, master-pool swap).
+        //
+        // Before the read-path was reverted to non-engaging, `load` engaged a
+        // shared borrow and leaked a decrement, so this `engage_borrow_mut`
+        // failed with AccountBorrowFailed at runtime (the regression).
+        view.check_borrow()
+            .expect("non-engaging read check must succeed on a fresh account");
+        let p = engage_borrow_mut(&view)
+            .expect("engage_borrow_mut after a non-engaging read check of the SAME account must succeed");
+        assert!(!p.is_null());
     }
 
     // ---- Gap 1: u128/i128 ArgsDeserialize ----

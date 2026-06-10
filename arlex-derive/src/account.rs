@@ -12,10 +12,12 @@ use sha2::{Sha256, Digest};
 /// - Writable check on load_mut
 /// - Uninitialized check on init (discriminator must be all zeros)
 /// - Byte-by-byte field access to avoid alignment UB
-/// - Borrow flag ENGAGED (not merely read) on load/load_mut/init via
-///   `arlex_lang::engage_borrow`/`engage_borrow_mut`, so a second `load_mut`
-///   of the same account within one instruction fails instead of producing an
-///   aliasing `&mut`. See FINDING 1 in arlex-lang for the full rationale.
+/// - Borrow flag ENGAGED (not merely read) on load_mut/init via
+///   `arlex_lang::engage_borrow_mut`, so a second `load_mut` of the same
+///   account within one instruction fails instead of producing an aliasing
+///   `&mut`/`&mut`. The immutable `load` path uses the NON-ENGAGING
+///   `check_borrow` so the legitimate read-then-mutate-same-account pattern
+///   stays legal. See FINDING 1 in arlex-lang for the full rationale.
 pub fn generate(input: ItemStruct) -> Result<TokenStream> {
     let name = &input.ident;
     let vis = &input.vis;
@@ -111,14 +113,22 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
             /// Load account data (read-only).
             /// Checks: discriminator, size, owner, borrow state.
             ///
-            /// Engages a SHARED borrow on the account for the rest of the
-            /// instruction (see `arlex_lang::engage_borrow`). A `load_mut` of
-            /// the same account afterwards fails, but multiple `load` (shared)
-            /// of the same account still succeed.
+            /// Uses the NON-ENGAGING read-only borrow check (`check_borrow`):
+            /// it verifies the account is not currently mutably borrowed but
+            /// does NOT engage the borrow flag. This keeps the legitimate
+            /// read-then-mutate-same-account pattern legal — a `load_mut` of the
+            /// same account after a `load` still succeeds (see FINDING 1 in
+            /// arlex-lang; the mut path engagement is what closes the aliasing
+            /// `&mut`/`&mut` UB, while engaging the read path would instead break
+            /// read-then-mutate and is therefore intentionally NOT done here).
             pub fn load<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
             ) -> core::result::Result<&'a Self, pinocchio::error::ProgramError> {
+                // Borrow check: ensure data is not already mutably borrowed.
+                // Read-only check — does NOT engage the flag, so a later
+                // load_mut of the same account can still engage it.
+                account.check_borrow()?;
                 // Check owner
                 if !account.owned_by(program_id) {
                     return Err(pinocchio::error::ProgramError::IllegalOwner);
@@ -133,13 +143,8 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
                 || data[4] != #d4 || data[5] != #d5 || data[6] != #d6 || data[7] != #d7 {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
                 }
-                // Engage a shared borrow for the rest of the instruction. Fails
-                // if the account is already mutably borrowed (e.g. a prior
-                // load_mut of the same account), so a load after a load_mut of
-                // the same account returns Err. Multiple shared loads succeed.
-                let data_ptr = arlex_lang::engage_borrow(account)?;
-                // Safety: repr(C, packed) alignment 1. Shared borrow engaged above.
-                Ok(unsafe { &*(data_ptr.add(8) as *const Self) })
+                // Safety: repr(C, packed) alignment 1. Borrow state checked above.
+                Ok(unsafe { &*(data.as_ptr().add(8) as *const Self) })
             }
 
             /// Load account data (mutable).
@@ -148,10 +153,14 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
             /// Enforces exclusive access by ENGAGING the mutable borrow flag
             /// via `arlex_lang::engage_borrow_mut` (which actually sets the
             /// flag, unlike the read-only `check_borrow_mut`). A second
-            /// `load_mut` (or a `load`/`load_mut` after `load`/`init`) of the
-            /// SAME account within the same instruction returns Err instead of
+            /// `load_mut` (or a `load_mut` after `init`/`load_mut`) of the SAME
+            /// account within the same instruction returns Err instead of
             /// producing a second aliasing `&mut Self`. `load_mut` of DIFFERENT
             /// accounts all succeed (their flags are independent).
+            ///
+            /// Note: a prior `load` (immutable, non-engaging) of the SAME
+            /// account does NOT block this `load_mut` — the read path leaves the
+            /// flag NOT_BORROWED, so read-then-mutate-same-account is legal.
             pub fn load_mut<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
@@ -188,8 +197,11 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
             /// Checks: writable, size, owner, not already initialized, borrow state.
             ///
             /// Engages the mutable borrow flag (see `load_mut`) so an `init`
-            /// followed by a `load_mut`/`load`/`init` of the SAME account in one
-            /// instruction returns Err instead of a second aliasing `&mut`.
+            /// followed by a `load_mut`/`init`/`load` of the SAME account in one
+            /// instruction returns Err instead of a second aliasing `&mut`
+            /// (a following `load`'s read-only `check_borrow` sees the engaged
+            /// mut flag and fails — only the reverse order, load-then-load_mut,
+            /// is intentionally allowed via the non-engaging read path).
             pub fn init<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
