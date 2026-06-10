@@ -12,6 +12,10 @@ use sha2::{Sha256, Digest};
 /// - Writable check on load_mut
 /// - Uninitialized check on init (discriminator must be all zeros)
 /// - Byte-by-byte field access to avoid alignment UB
+/// - Borrow flag ENGAGED (not merely read) on load/load_mut/init via
+///   `arlex_lang::engage_borrow`/`engage_borrow_mut`, so a second `load_mut`
+///   of the same account within one instruction fails instead of producing an
+///   aliasing `&mut`. See FINDING 1 in arlex-lang for the full rationale.
 pub fn generate(input: ItemStruct) -> Result<TokenStream> {
     let name = &input.ident;
     let vis = &input.vis;
@@ -76,12 +80,15 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
 
             /// Load account data (read-only).
             /// Checks: discriminator, size, owner, borrow state.
+            ///
+            /// Engages a SHARED borrow on the account for the rest of the
+            /// instruction (see `arlex_lang::engage_borrow`). A `load_mut` of
+            /// the same account afterwards fails, but multiple `load` (shared)
+            /// of the same account still succeed.
             pub fn load<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
             ) -> core::result::Result<&'a Self, pinocchio::error::ProgramError> {
-                // Borrow check: ensure data is not already mutably borrowed
-                account.check_borrow()?;
                 // Check owner
                 if !account.owned_by(program_id) {
                     return Err(pinocchio::error::ProgramError::IllegalOwner);
@@ -96,19 +103,29 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
                 || data[4] != #d4 || data[5] != #d5 || data[6] != #d6 || data[7] != #d7 {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
                 }
-                // Safety: repr(C, packed) alignment 1. Borrow state checked above.
-                Ok(unsafe { &*(data.as_ptr().add(8) as *const Self) })
+                // Engage a shared borrow for the rest of the instruction. Fails
+                // if the account is already mutably borrowed (e.g. a prior
+                // load_mut of the same account), so a load after a load_mut of
+                // the same account returns Err. Multiple shared loads succeed.
+                let data_ptr = arlex_lang::engage_borrow(account)?;
+                // Safety: repr(C, packed) alignment 1. Shared borrow engaged above.
+                Ok(unsafe { &*(data_ptr.add(8) as *const Self) })
             }
 
             /// Load account data (mutable).
             /// Checks: discriminator, size, owner, writable, borrow state.
-            /// Enforces exclusive access — will fail if account data is already borrowed.
+            ///
+            /// Enforces exclusive access by ENGAGING the mutable borrow flag
+            /// via `arlex_lang::engage_borrow_mut` (which actually sets the
+            /// flag, unlike the read-only `check_borrow_mut`). A second
+            /// `load_mut` (or a `load`/`load_mut` after `load`/`init`) of the
+            /// SAME account within the same instruction returns Err instead of
+            /// producing a second aliasing `&mut Self`. `load_mut` of DIFFERENT
+            /// accounts all succeed (their flags are independent).
             pub fn load_mut<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
             ) -> core::result::Result<&'a mut Self, pinocchio::error::ProgramError> {
-                // Borrow check: ensure data is not already borrowed (mutable or immutable)
-                account.check_borrow_mut()?;
                 // Check writable
                 if !account.is_writable() {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
@@ -127,19 +144,26 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
                 || data[4] != #d4 || data[5] != #d5 || data[6] != #d6 || data[7] != #d7 {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
                 }
-                // Safety: repr(C, packed) alignment 1. Borrow state + writable checked above.
-                // Exclusive access enforced by check_borrow_mut().
-                Ok(unsafe { &mut *(account.data_ptr().add(8) as *mut Self) })
+                // Engage the mutable borrow flag for the rest of the instruction.
+                // Fails (AccountBorrowFailed) if the account is already borrowed,
+                // which closes the aliasing &mut window. The flag stays engaged
+                // (guard leaked) and is reset by the runtime at instruction entry.
+                let data_ptr = arlex_lang::engage_borrow_mut(account)?;
+                // Safety: repr(C, packed) alignment 1. Writable checked above;
+                // exclusive access enforced by the engaged mutable borrow.
+                Ok(unsafe { &mut *(data_ptr.add(8) as *mut Self) })
             }
 
             /// Initialize: write discriminator to account data.
             /// Checks: writable, size, owner, not already initialized, borrow state.
+            ///
+            /// Engages the mutable borrow flag (see `load_mut`) so an `init`
+            /// followed by a `load_mut`/`load`/`init` of the SAME account in one
+            /// instruction returns Err instead of a second aliasing `&mut`.
             pub fn init<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
             ) -> core::result::Result<&'a mut Self, pinocchio::error::ProgramError> {
-                // Borrow check
-                account.check_borrow_mut()?;
                 // Check writable
                 if !account.is_writable() {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
@@ -159,16 +183,19 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
                 if !is_zeroed {
                     return Err(pinocchio::error::ProgramError::AccountAlreadyInitialized);
                 }
-                // Write discriminator
+                // Engage the mutable borrow flag for the rest of the instruction.
+                // Fails if the account is already borrowed; otherwise stays
+                // engaged (guard leaked) and is reset by the runtime at entry.
+                let ptr = arlex_lang::engage_borrow_mut(account)?;
+                // Write discriminator through the engaged pointer.
                 unsafe {
-                    let ptr = account.data_ptr();
                     *ptr.add(0) = #d0; *ptr.add(1) = #d1;
                     *ptr.add(2) = #d2; *ptr.add(3) = #d3;
                     *ptr.add(4) = #d4; *ptr.add(5) = #d5;
                     *ptr.add(6) = #d6; *ptr.add(7) = #d7;
                 }
                 // Return mutable reference to data
-                Ok(unsafe { &mut *(account.data_ptr().add(8) as *mut Self) })
+                Ok(unsafe { &mut *(ptr.add(8) as *mut Self) })
             }
         }
     })

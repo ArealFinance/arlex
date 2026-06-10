@@ -296,6 +296,80 @@ impl<T: ArgsDeserialize> ArgsDeserialize for Option<T> {
 }
 
 // ============================================================
+// Borrow-flag engagement helpers (FINDING 1 — aliasing &mut prevention)
+//
+// Background: pinocchio's `AccountView::check_borrow_mut()` only READS the
+// borrow flag (returns Ok if the flag == NOT_BORROWED) and never mutates it.
+// Generated `load_mut`/`init` previously called that read-only check and then
+// handed out `&mut Self` from the data pointer. Two `load_mut` of the SAME
+// account both passed the read-only check, producing two live `&mut Self`
+// aliasing the same memory — undefined behavior.
+//
+// Fix: `try_borrow_mut()` actually engages the flag (sets borrow_state = 0)
+// and returns a `RefMut` whose `Drop` would restore NOT_BORROWED. We engage
+// the flag and then `mem::forget` the guard, so the flag stays engaged for
+// the remainder of the instruction. A second engagement of the SAME account
+// then fails (`try_borrow_mut` re-checks the flag and sees it is not
+// NOT_BORROWED), while engaging a DIFFERENT account succeeds (its flag is
+// independent). The Solana runtime resets all borrow flags at instruction
+// entry, so "engage and never release" is correct per-instruction and needs
+// no RAII guard at the call site — the public return type stays `&mut Self`.
+// ============================================================
+
+/// Engage the mutable borrow flag on `account` for the rest of the
+/// instruction and return a raw pointer to its data region.
+///
+/// Returns `Err(ProgramError::AccountBorrowFailed)` if the account is already
+/// borrowed (mutably or immutably) — this is what makes a second `load_mut`
+/// of the same account fail instead of producing an aliasing `&mut`.
+///
+/// The returned pointer is to the start of the account data (offset 0). The
+/// caller is responsible for advancing past the 8-byte discriminator.
+///
+/// # Safety
+/// The borrow flag stays engaged until instruction exit (the guard is
+/// intentionally leaked via `core::mem::forget`). This is sound because the
+/// runtime resets borrow flags at every instruction entry.
+#[inline]
+pub fn engage_borrow_mut(account: &AccountView) -> core::result::Result<*mut u8, ProgramError> {
+    // try_borrow_mut() re-checks the flag and engages it (borrow_state = 0).
+    // Fails if the account is already borrowed in any form.
+    let guard = account.try_borrow_mut()?;
+    // Leak the guard so the flag stays engaged for the rest of the instruction.
+    // Without this, Drop would restore NOT_BORROWED and a second load_mut would
+    // succeed, re-opening the aliasing window.
+    core::mem::forget(guard);
+    Ok(account.data_ptr())
+}
+
+/// Engage a shared (immutable) borrow on `account` for the rest of the
+/// instruction and return a raw pointer to its data region.
+///
+/// Returns `Err(ProgramError::AccountBorrowFailed)` if the account is already
+/// mutably borrowed. Multiple shared engagements of the same account succeed
+/// (the immutable borrow counter starts at NOT_BORROWED = 255 and is
+/// decremented per engagement), so legitimate multiple immutable reads of the
+/// same account keep working. A shared engagement after a mutable engagement
+/// (or vice versa) of the same account fails, as required.
+///
+/// Note: because each engagement leaks one decrement of the immutable borrow
+/// counter, the same account can be immutably engaged at most 253 times in a
+/// single instruction before the counter floor is reached. This is far beyond
+/// any realistic instruction's read count.
+///
+/// # Safety
+/// Same as [`engage_borrow_mut`]: the borrow is intentionally leaked and the
+/// runtime resets borrow flags at instruction entry.
+#[inline]
+pub fn engage_borrow(account: &AccountView) -> core::result::Result<*const u8, ProgramError> {
+    // try_borrow() re-checks the flag and engages a shared borrow.
+    // Fails if the account is already mutably borrowed.
+    let guard = account.try_borrow()?;
+    core::mem::forget(guard);
+    Ok(account.data_ptr() as *const u8)
+}
+
+// ============================================================
 // Safe account loading helpers
 // These use byte-by-byte reads to avoid alignment issues.
 // ============================================================
@@ -702,6 +776,114 @@ pub fn base58_decode(input: &str) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::math::*;
+
+    // ---- FINDING 1: borrow-flag engagement (aliasing &mut prevention) ----
+
+    use pinocchio::account::{RuntimeAccount, NOT_BORROWED};
+
+    /// Backing storage for a fabricated `AccountView`: a `RuntimeAccount`
+    /// header immediately followed by `DATA` bytes of account data, matching
+    /// the runtime's in-memory layout. Over-aligned to `RuntimeAccount`.
+    #[repr(C, align(8))]
+    struct FakeAccount {
+        header: RuntimeAccount,
+        data: [u8; 64],
+    }
+
+    impl FakeAccount {
+        fn new() -> Box<Self> {
+            let mut header = RuntimeAccount::default();
+            // Runtime guarantees the flag is NOT_BORROWED at instruction entry.
+            header.borrow_state = NOT_BORROWED;
+            header.data_len = 64;
+            header.is_writable = 1;
+            Box::new(FakeAccount {
+                header,
+                data: [0u8; 64],
+            })
+        }
+
+        /// Build an `AccountView` pointing at this account's header.
+        ///
+        /// # Safety
+        /// The returned view borrows from `self`; the `FakeAccount` must
+        /// outlive the view and not be moved while the view is in use.
+        unsafe fn view(&mut self) -> AccountView {
+            AccountView::new_unchecked(&mut self.header as *mut RuntimeAccount)
+        }
+    }
+
+    #[test]
+    fn test_engage_borrow_mut_second_engage_fails() {
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        // First engagement succeeds and engages the flag.
+        let p1 = engage_borrow_mut(&view).expect("first engage_borrow_mut must succeed");
+        assert!(!p1.is_null());
+
+        // Second engagement of the SAME account must fail while the first is
+        // live — this is the core anti-aliasing guarantee.
+        assert!(
+            engage_borrow_mut(&view).is_err(),
+            "second engage_borrow_mut of same account must fail"
+        );
+    }
+
+    #[test]
+    fn test_engage_borrow_mut_two_different_accounts_succeed() {
+        let mut a = FakeAccount::new();
+        let mut b = FakeAccount::new();
+        let view_a = unsafe { a.view() };
+        let view_b = unsafe { b.view() };
+
+        // Different accounts have independent flags — both must succeed
+        // (swap.rs holds two different accounts' mut handles live).
+        assert!(engage_borrow_mut(&view_a).is_ok());
+        assert!(engage_borrow_mut(&view_b).is_ok());
+    }
+
+    #[test]
+    fn test_engage_borrow_then_borrow_mut_same_account_fails() {
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        // Shared engagement first, then mutable engagement of the same account
+        // must fail (load_mut after load).
+        assert!(engage_borrow(&view).is_ok());
+        assert!(
+            engage_borrow_mut(&view).is_err(),
+            "engage_borrow_mut after engage_borrow of same account must fail"
+        );
+    }
+
+    #[test]
+    fn test_engage_borrow_mut_then_borrow_same_account_fails() {
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        // Mutable engagement first, then shared engagement of the same account
+        // must fail (load after load_mut).
+        assert!(engage_borrow_mut(&view).is_ok());
+        assert!(
+            engage_borrow(&view).is_err(),
+            "engage_borrow after engage_borrow_mut of same account must fail"
+        );
+    }
+
+    #[test]
+    fn test_multiple_shared_engages_same_account_succeed() {
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        // Multiple immutable reads of the SAME account must keep working.
+        for _ in 0..16 {
+            assert!(
+                engage_borrow(&view).is_ok(),
+                "repeated engage_borrow of same account must succeed"
+            );
+        }
+    }
 
     // ---- Gap 1: u128/i128 ArgsDeserialize ----
 
