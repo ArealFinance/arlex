@@ -1,0 +1,5 @@
+error: bump constraint requires seeds; standalone bump has no effect
+  --> tests/cases/accounts_bump_no_seeds.rs:12:5
+   |
+12 |     #[account(mut, bump)]
+   |     ^^^^^^^^^^^^^^^^^^^^^

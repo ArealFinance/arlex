@@ -58,4 +58,5 @@ fn compile_tests() {
     t.compile_fail("tests/cases/accounts_has_one_no_type.rs");
     t.compile_fail("tests/cases/accounts_account_type_no_has_one.rs");
     t.compile_fail("tests/cases/accounts_close_not_found.rs");
+    t.compile_fail("tests/cases/accounts_bump_no_seeds.rs");
 }

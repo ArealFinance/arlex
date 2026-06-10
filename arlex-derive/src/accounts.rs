@@ -161,6 +161,17 @@ fn parse_constraints(attr: &syn::Attribute) -> Result<AccountConstraints> {
         }
     }
 
+    // FINDING 5: a standalone `bump` (without `seeds`) is never read in
+    // codegen — it was a pure no-op that gave false Anchor-like PDA security.
+    // Reject it so the mistake surfaces at compile time. `seeds + bump`
+    // (with or without `init`) is unchanged: those paths drive PDA derivation.
+    if c.bump && c.seeds.is_none() {
+        return Err(Error::new_spanned(
+            attr,
+            "bump constraint requires seeds; standalone bump has no effect",
+        ));
+    }
+
     Ok(c)
 }
 
