@@ -3,30 +3,16 @@
 /// Default SOL price fallback (updated manually)
 const DEFAULT_SOL_PRICE: f64 = 85.0;
 
-/// Get current SOL price. Tries CoinGecko API, falls back to default.
+/// Get current SOL price.
+///
+/// Returns the manually-maintained `DEFAULT_SOL_PRICE` constant. The price is
+/// used only for a cosmetic USD estimate in the deploy/size output, so the CLI
+/// does not make a live network call (which previously hit CoinGecko via
+/// reqwest, adding a heavy HTTP/TLS dependency and a startup network round-trip
+/// for a non-essential display value). Kept as a thin wrapper so call sites and
+/// the public surface are unchanged.
 pub fn get_sol_price() -> f64 {
-    // Try to fetch live price (non-blocking, quick timeout)
-    if let Ok(price) = fetch_sol_price() {
-        return price;
-    }
     DEFAULT_SOL_PRICE
-}
-
-fn fetch_sol_price() -> Result<f64, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd")
-        .send()
-        .map_err(|e| e.to_string())?;
-
-    let json: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
-    json["solana"]["usd"]
-        .as_f64()
-        .ok_or("No price in response".into())
 }
 
 /// Calculate rent-exempt minimum for an account of given size in bytes.
@@ -121,6 +107,15 @@ pub fn validate_network(network: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== get_sol_price ====================
+
+    #[test]
+    fn test_get_sol_price_is_deterministic_fallback() {
+        // No network call: get_sol_price always returns the manual constant.
+        assert_eq!(get_sol_price(), DEFAULT_SOL_PRICE);
+        assert_eq!(get_sol_price(), 85.0);
+    }
 
     // ==================== validate_project_name ====================
 
