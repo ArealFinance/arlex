@@ -166,8 +166,9 @@ pub mod token_vault {
             return Err(ProgramError::from(VaultError::InvalidTokenMint));
         }
 
-        // Initialize vault state
-        let vault = Vault::init(ctx.accounts.vault, ctx.program_id)?;
+        // Initialize vault state. `mut` binding required: field writes go
+        // through the guard's DerefMut.
+        let mut vault = Vault::init(ctx.accounts.vault, ctx.program_id)?;
         vault.authority.copy_from_slice(ctx.accounts.authority.address().as_ref());
         vault.token_mint.copy_from_slice(ctx.accounts.token_mint.address().as_ref());
         vault.vault_token_account.copy_from_slice(ctx.accounts.vault_token_account.address().as_ref());
@@ -188,8 +189,11 @@ pub mod token_vault {
             return Err(ProgramError::from(VaultError::ZeroAmount));
         }
 
-        // CHECKS: Load vault, verify vault_token_account matches stored address
-        let vault = Vault::load_mut(ctx.accounts.vault, ctx.program_id)?;
+        // CHECKS: Load vault, verify vault_token_account matches stored address.
+        // `mut` binding is required: writing through the guard uses DerefMut.
+        // The vault PDA account is NOT passed into the deposit CPI (the
+        // depositor signs), so the guard may stay live across the transfer.
+        let mut vault = Vault::load_mut(ctx.accounts.vault, ctx.program_id)?;
         if vault.vault_token_account != *ctx.accounts.vault_token_account.address().as_ref() {
             return Err(ProgramError::from(VaultError::InvalidVaultTokenAccount));
         }
@@ -240,42 +244,58 @@ pub mod token_vault {
             return Err(ProgramError::from(VaultError::ZeroAmount));
         }
 
-        // CHECKS: Load vault, verify authority, balance, and token account
-        let vault = Vault::load_mut(ctx.accounts.vault, ctx.program_id)?;
+        // CHECKS + EFFECTS: Load vault, validate, update state. The mutable
+        // borrow guard is scoped to this block so its Drop RELEASES the borrow
+        // flag before the CPI below — the vault PDA is passed into the Transfer
+        // CPI as the signing authority, which the checked CPI invoke would
+        // reject if the account were still mutably borrowed. Copy out the seed
+        // material (authority, bump) and the post-update total for the event.
+        let vault_authority: [u8; 32];
+        let vault_bump: u8;
+        let new_total: u64;
+        {
+            let mut vault = Vault::load_mut(ctx.accounts.vault, ctx.program_id)?;
 
-        if vault.authority != *ctx.accounts.authority.address().as_ref() {
-            return Err(ProgramError::from(VaultError::Unauthorized));
-        }
+            if vault.authority != *ctx.accounts.authority.address().as_ref() {
+                return Err(ProgramError::from(VaultError::Unauthorized));
+            }
 
-        if vault.vault_token_account != *ctx.accounts.vault_token_account.address().as_ref() {
-            return Err(ProgramError::from(VaultError::InvalidVaultTokenAccount));
-        }
+            if vault.vault_token_account != *ctx.accounts.vault_token_account.address().as_ref() {
+                return Err(ProgramError::from(VaultError::InvalidVaultTokenAccount));
+            }
 
-        if vault.total_deposited < amount {
-            return Err(ProgramError::from(VaultError::InsufficientBalance));
-        }
+            if vault.total_deposited < amount {
+                return Err(ProgramError::from(VaultError::InsufficientBalance));
+            }
 
-        // Verify recipient_token_account mint matches vault token_mint
-        let rta_data = unsafe {
-            core::slice::from_raw_parts(
-                ctx.accounts.recipient_token_account.data_ptr(),
-                ctx.accounts.recipient_token_account.data_len(),
-            )
-        };
-        if rta_data.len() >= 32 && &rta_data[0..32] != &vault.token_mint {
-            return Err(ProgramError::from(VaultError::InvalidTokenMint));
-        }
+            // Verify recipient_token_account mint matches vault token_mint
+            let rta_data = unsafe {
+                core::slice::from_raw_parts(
+                    ctx.accounts.recipient_token_account.data_ptr(),
+                    ctx.accounts.recipient_token_account.data_len(),
+                )
+            };
+            if rta_data.len() >= 32 && &rta_data[0..32] != &vault.token_mint {
+                return Err(ProgramError::from(VaultError::InvalidTokenMint));
+            }
 
-        // EFFECTS: Update state before CPI
-        vault.total_deposited = vault.total_deposited
-            .checked_sub(amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+            // EFFECTS: Update state before CPI
+            vault.total_deposited = vault.total_deposited
+                .checked_sub(amount)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
 
-        // INTERACTIONS: CPI transfer from vault to recipient (PDA signer)
-        let bump_bytes = [vault.bump];
+            vault_authority = vault.authority;
+            vault_bump = vault.bump;
+            new_total = vault.total_deposited;
+        } // guard dropped here — borrow flag released for the CPI
+
+        // INTERACTIONS: CPI transfer from vault to recipient (PDA signer).
+        // The vault is no longer borrowed, so passing it as the CPI authority
+        // is accepted by the checked invoke.
+        let bump_bytes = [vault_bump];
         let seeds = [
             arlex_lang::Seed::from(b"vault" as &[u8]),
-            arlex_lang::Seed::from(vault.authority.as_ref()),
+            arlex_lang::Seed::from(vault_authority.as_ref()),
             arlex_lang::Seed::from(bump_bytes.as_ref()),
         ];
         let signer = arlex_lang::Signer::from(&seeds);
@@ -288,9 +308,9 @@ pub mod token_vault {
         }.invoke_signed(&[signer])?;
 
         emit!(Withdrawn {
-            authority: vault.authority,
+            authority: vault_authority,
             amount,
-            new_total: vault.total_deposited,
+            new_total,
         });
 
         arlex_lang::log("Withdrawal successful");

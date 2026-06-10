@@ -45,7 +45,8 @@ pub mod counter {
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let counter = Counter::init(ctx.accounts.counter, ctx.program_id)?;
+        // `mut` binding required: field writes go through the guard's DerefMut.
+        let mut counter = Counter::init(ctx.accounts.counter, ctx.program_id)?;
         counter.authority.copy_from_slice(ctx.accounts.authority.address().as_ref());
         counter.count = 0;
         arlex_lang::log("Counter initialized");
@@ -53,7 +54,8 @@ pub mod counter {
     }
 
     pub fn increment(ctx: Context<Increment>) -> Result<()> {
-        let counter = Counter::load_mut(ctx.accounts.counter, ctx.program_id)?;
+        // `mut` binding required: count write goes through the guard's DerefMut.
+        let mut counter = Counter::load_mut(ctx.accounts.counter, ctx.program_id)?;
 
         // Verify authority
         if counter.authority != *ctx.accounts.authority.address().as_ref() {
