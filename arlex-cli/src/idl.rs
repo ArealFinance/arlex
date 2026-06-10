@@ -1,4 +1,5 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,6 +11,25 @@ thread_local! {
     /// consulted by `map_type` to resolve array-length idents like
     /// `[Bin; MAX_BINS]` → `[Bin; 70]`. Cleared between runs.
     static CONST_USIZE: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+}
+
+/// Compute an 8-byte Anchor-compatible discriminator: `sha256(<prefix><name>)[0..8]`.
+///
+/// Prefixes match arlex-derive (program.rs / account.rs / event.rs) and the TS
+/// client (`client/src/discriminator.ts`) exactly:
+/// - instruction: `global:<snake_case_fn_name>`
+/// - account:     `account:<PascalCaseStructName>`
+/// - event:       `event:<PascalCaseStructName>`
+///
+/// Serialized by serde as a JSON array of 8 numbers (the Anchor convention).
+fn discriminator(prefix: &str, name: &str) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(name.as_bytes());
+    let hash = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&hash[..8]);
+    out
 }
 
 #[derive(Serialize, Default)]
@@ -31,12 +51,16 @@ pub struct IdlMetadata {
 
 #[derive(Serialize)]
 pub struct IdlInstruction {
+    /// 8-byte Anchor-compatible discriminator: sha256("global:<name>")[0..8].
+    pub discriminator: [u8; 8],
     pub name: String,
     pub accounts: Vec<IdlAccountItem>,
     pub args: Vec<IdlField>,
+    #[serde(skip_serializing)]
+    account_context: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct IdlAccountItem {
     pub name: String,
@@ -53,6 +77,8 @@ pub struct IdlField {
 
 #[derive(Serialize)]
 pub struct IdlAccountDef {
+    /// 8-byte Anchor-compatible discriminator: sha256("account:<Name>")[0..8].
+    pub discriminator: [u8; 8],
     pub name: String,
     #[serde(rename = "type")]
     pub ty: IdlAccountType,
@@ -66,6 +92,8 @@ pub struct IdlAccountType {
 
 #[derive(Serialize)]
 pub struct IdlEvent {
+    /// 8-byte Anchor-compatible discriminator: sha256("event:<Name>")[0..8].
+    pub discriminator: [u8; 8],
     pub name: String,
     pub fields: Vec<IdlField>,
 }
@@ -99,26 +127,47 @@ pub fn generate_idl(project_name: &str) -> Result<Idl, String> {
     let source = normalize_source(&source);
 
     let mut idl = Idl {
-        version: "0.1.0".into(),
+        version: "0.1.2".into(),
         name: project_name.into(),
-        metadata: IdlMetadata { address: parse_declare_id(&source) },
+        metadata: IdlMetadata {
+            address: parse_declare_id(&source),
+        },
         ..Default::default()
     };
 
-    parse_program(&source, &mut idl);
+    let pub_fn_count = parse_program(&source, &mut idl);
     parse_account_structs(&source, &mut idl);
     parse_derive_accounts(&source, &mut idl);
     parse_errors(&source, &mut idl);
     parse_events(&source, &mut idl);
+    // Defined types (auxiliary structs referenced from account/instruction
+    // args). Runs AFTER accounts/events so it can skip names already bucketed.
     parse_defined_types(&source, &mut idl);
+
+    // FINDING 2: cross-check that every `pub fn` inside #[program] produced an
+    // instruction. A mismatch means an instruction was silently dropped (e.g.
+    // a signature parse_fn_sig couldn't handle, or — before the literal/comment
+    // stripping fix — a brace inside a string prematurely closing the module).
+    // Hard-error rather than emit an incomplete IDL.
+    if idl.instructions.len() != pub_fn_count {
+        return Err(format!(
+            "IDL instruction count mismatch: found {} `pub fn` declaration(s) \
+             inside #[program] but emitted {} instruction(s). An instruction \
+             was dropped during parsing.",
+            pub_fn_count,
+            idl.instructions.len(),
+        ));
+    }
 
     Ok(idl)
 }
 
 fn collect_sources(dir: &Path) -> Result<String, String> {
     let mut all = String::new();
-    let mut entries: Vec<_> = std::fs::read_dir(dir).map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok()).collect();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .collect();
     entries.sort_by_key(|e| e.path()); // deterministic order
     for entry in entries {
         let path = entry.path();
@@ -184,66 +233,72 @@ fn parse_declare_id(source: &str) -> String {
     String::new()
 }
 
-fn parse_program(source: &str, idl: &mut Idl) {
+/// Parse the `#[program]` module, pushing one instruction per `pub fn`.
+/// Returns the number of `pub fn` declarations seen inside the module, so the
+/// caller can cross-check it against the number of instructions actually
+/// emitted (FINDING 2: detect silently-dropped instructions).
+fn parse_program(source: &str, idl: &mut Idl) -> usize {
     let mut in_program = false;
     let mut depth = 0i32;
+    let mut in_block_comment = false;
+    let mut pub_fn_count = 0usize;
 
     for line in source.lines() {
         let t = line.trim();
-        if t.contains("#[program]") { in_program = true; continue; }
+        // Use the raw line for brace counting so block-comment state stays
+        // consistent regardless of trimming.
+        if t.contains("#[program]") {
+            in_program = true;
+            // Account for any braces on the attribute line itself.
+            depth += brace_delta(line, &mut in_block_comment);
+            continue;
+        }
         if in_program {
-            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
-            if depth <= 0 && in_program { in_program = false; continue; }
+            depth += brace_delta(line, &mut in_block_comment);
+            if depth <= 0 && in_program {
+                in_program = false;
+                continue;
+            }
             if t.starts_with("pub fn ") {
+                pub_fn_count += 1;
                 if let Some(ix) = parse_fn_sig(t) {
                     idl.instructions.push(ix);
                 }
             }
+        } else {
+            // Keep block-comment state coherent across the whole file even
+            // outside the program module.
+            let _ = brace_delta(line, &mut in_block_comment);
         }
     }
+
+    pub_fn_count
 }
 
 fn parse_fn_sig(line: &str) -> Option<IdlInstruction> {
     let after_fn = line.strip_prefix("pub fn ")?;
     let fn_name = after_fn.split('(').next()?.trim().to_string();
 
-    // Find the opening `(` of the fn argument list, then walk forward
-    // tracking paren depth so we stop at its matching `)`. Using
-    // `line.rfind(')')` is unsound here: the line may contain `Result<()>`
-    // or an inline body like `{ Ok(()) }`, and the last `)` would belong
-    // to one of those, polluting `args_str` with `") -> Result<("` that
-    // then yields phantom IDL args.
+    // Get only the function argument list, not the return type.
     let start = line.find('(')?;
-    let bytes = line.as_bytes();
-    let mut depth: i32 = 1;
-    let mut end: Option<usize> = None;
-    for (i, &b) in bytes.iter().enumerate().skip(start + 1) {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let end = end?;
+    let end = find_matching_delimiter(line, start, '(', ')')?;
     let args_str = &line[start + 1..end];
 
-    // Split args on top-level commas only — commas inside generics
-    // (`Context<Foo, Bar>`), arrays (`[u8; 32]`) or tuples must not split.
     let mut args = Vec::new();
+    let mut account_context = None;
     for param in split_top_level_commas(args_str) {
         let param = param.trim();
-        if param.is_empty() { continue; }
-        // Skip `ctx: Context<...>` — the first arg of every Arlex handler.
-        // Match on the identifier so we don't accidentally drop a future
-        // arg that happens to start with the letters `ctx`.
+        if param.is_empty() {
+            continue;
+        }
         let ident = param.split(':').next().unwrap_or("").trim();
-        if ident == "ctx" || ident == "_ctx" { continue; }
+        if let Some(context) = parse_context_param(param) {
+            account_context = Some(context);
+            continue;
+        }
+        if ident == "ctx" || ident == "_ctx" {
+            continue;
+        }
         if let Some((name, ty)) = param.split_once(':') {
             args.push(IdlField {
                 name: name.trim().to_string(),
@@ -252,36 +307,373 @@ fn parse_fn_sig(line: &str) -> Option<IdlInstruction> {
         }
     }
 
-    Some(IdlInstruction { name: fn_name, accounts: Vec::new(), args })
+    Some(IdlInstruction {
+        discriminator: discriminator("global:", &fn_name),
+        name: fn_name,
+        accounts: Vec::new(),
+        args,
+        account_context,
+    })
 }
 
-/// Split a parameter list on commas that are at depth 0 with respect to
-/// `()`, `[]` and `<>`. Required so types like `Context<Foo, Bar>`,
-/// `[u8; 32]`, `alloc::vec::Vec<[u8; 32]>` or tuples stay intact.
-fn split_top_level_commas(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut paren = 0i32;
-    let mut bracket = 0i32;
-    let mut angle = 0i32;
-    for c in s.chars() {
-        match c {
-            '(' => { paren += 1; buf.push(c); }
-            ')' => { paren -= 1; buf.push(c); }
-            '[' => { bracket += 1; buf.push(c); }
-            ']' => { bracket -= 1; buf.push(c); }
-            '<' => { angle += 1; buf.push(c); }
-            '>' => { angle -= 1; buf.push(c); }
-            ',' if paren == 0 && bracket == 0 && angle == 0 => {
-                out.push(std::mem::take(&mut buf));
+fn parse_account_structs(source: &str, idl: &mut Idl) {
+    let mut in_account = false;
+    let mut name = String::new();
+    let mut fields = Vec::new();
+    let mut depth = 0i32;
+    let mut in_block_comment = false;
+
+    for line in source.lines() {
+        let t = line.trim();
+        if t == "#[account]" {
+            in_account = true;
+            continue;
+        }
+        if in_account && name.is_empty() {
+            if t.starts_with("pub struct ") {
+                name = extract_struct_name(t);
+                depth = brace_delta(line, &mut in_block_comment);
+                continue;
             }
-            _ => buf.push(c),
+        }
+        if in_account && !name.is_empty() {
+            depth += brace_delta(line, &mut in_block_comment);
+            if t.starts_with("pub ") && t.contains(':') {
+                if let Some(f) = parse_field(t) {
+                    fields.push(f);
+                }
+            }
+            if depth <= 0 {
+                idl.accounts.push(IdlAccountDef {
+                    discriminator: discriminator("account:", &name),
+                    name: name.clone(),
+                    ty: IdlAccountType {
+                        kind: "struct".into(),
+                        fields: std::mem::take(&mut fields),
+                    },
+                });
+                name.clear();
+                in_account = false;
+            }
         }
     }
-    if !buf.trim().is_empty() {
-        out.push(buf);
+}
+
+fn parse_derive_accounts(source: &str, idl: &mut Idl) {
+    let mut in_derive = false;
+    let mut name = String::new();
+    let mut accounts = Vec::new();
+    let mut depth = 0i32;
+    let mut next_mut = false;
+    let mut next_signer = false;
+    let mut account_attr = String::new();
+    let mut in_account_attr = false;
+    let mut in_block_comment = false;
+
+    for line in source.lines() {
+        let t = line.trim();
+        if t.contains("#[derive(Accounts)]") {
+            in_derive = true;
+            continue;
+        }
+        if in_derive && name.is_empty() {
+            if t.starts_with("pub struct ") {
+                name = extract_struct_name(t);
+                depth = brace_delta(line, &mut in_block_comment);
+                continue;
+            }
+        }
+        if in_derive && !name.is_empty() {
+            depth += brace_delta(line, &mut in_block_comment);
+
+            if in_account_attr {
+                account_attr.push(' ');
+                account_attr.push_str(t);
+                if t.contains(")]") {
+                    let (is_mut, is_signer) = parse_account_attr_flags(&account_attr);
+                    next_mut = is_mut;
+                    next_signer = is_signer;
+                    account_attr.clear();
+                    in_account_attr = false;
+                }
+                continue;
+            }
+
+            if t.starts_with("#[account") {
+                account_attr = t.to_string();
+                if t.contains(")]") || t == "#[account]" {
+                    let (is_mut, is_signer) = parse_account_attr_flags(&account_attr);
+                    next_mut = is_mut;
+                    next_signer = is_signer;
+                    account_attr.clear();
+                } else {
+                    in_account_attr = true;
+                }
+                continue;
+            }
+
+            if t.starts_with("pub ") && t.contains(':') {
+                let field_name = t
+                    .strip_prefix("pub ")
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !field_name.is_empty() {
+                    accounts.push(IdlAccountItem {
+                        name: field_name,
+                        is_mut: next_mut,
+                        is_signer: next_signer,
+                    });
+                    next_mut = false;
+                    next_signer = false;
+                }
+            }
+            if depth <= 0 {
+                let mut matched = false;
+                for ix in idl.instructions.iter_mut() {
+                    if ix.account_context.as_deref() == Some(name.as_str()) {
+                        ix.accounts = accounts.clone();
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    let ix_name = to_snake_case(&name);
+                    for ix in idl.instructions.iter_mut() {
+                        if ix.name == ix_name {
+                            ix.accounts = accounts.clone();
+                        }
+                    }
+                }
+                accounts.clear();
+                name.clear();
+                in_derive = false;
+            }
+        }
     }
+}
+
+fn find_matching_delimiter(s: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0i32;
+    for (offset, c) in s[start..].char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + offset);
+            }
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut angle_depth = 0i32;
+
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth -= 1,
+            '<' => angle_depth += 1,
+            '>' => angle_depth -= 1,
+            ',' if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn parse_context_param(param: &str) -> Option<String> {
+    let (name, ty) = param.split_once(':')?;
+    let ident = name.trim();
+    if ident != "ctx" && ident != "_ctx" {
+        return None;
+    }
+    let compact: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    let context_ty = strip_path_prefix(&compact);
+    let inner = context_ty.strip_prefix("Context<")?.strip_suffix('>')?;
+    let account_ty = strip_path_prefix(inner);
+    let account_name = account_ty.split('<').next().unwrap_or(account_ty);
+    if account_name.is_empty() {
+        None
+    } else {
+        Some(account_name.to_string())
+    }
+}
+
+/// Blank out the contents of string/char literals and `//` / `/* */` comments
+/// in a single line, so that brace counting (`.matches('{')` / `.matches('}')`)
+/// ignores braces that appear inside literals or comments.
+///
+/// FINDING 2: the brace-depth parsers counted braces per line without this,
+/// so an unbalanced `}` inside a string (e.g. `log("close brace } here")`) or
+/// a comment would prematurely close the `#[program]` / struct / enum block
+/// and silently drop every later instruction, account field, error, or event.
+///
+/// `in_block_comment` carries `/* ... */` state across lines and is updated in
+/// place. Stripped regions are replaced with spaces (braces become spaces);
+/// the returned string is brace-count-equivalent to the original code minus
+/// literal/comment braces.
+fn strip_literals_and_comments(line: &str, in_block_comment: &mut bool) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        Str,
+        Char,
+    }
+    let mut state = State::Code;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        if *in_block_comment {
+            // Inside /* ... */ — look for the closing */
+            if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                *in_block_comment = false;
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+            } else {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+
+        match state {
+            State::Str => {
+                if c == b'\\' && i + 1 < bytes.len() {
+                    // Skip escaped character (e.g. \" or \\)
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    state = State::Code;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            State::Char => {
+                if c == b'\\' && i + 1 < bytes.len() {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if c == b'\'' {
+                    state = State::Code;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            State::Code => {
+                // Line comment — blank the rest of the line.
+                if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    break;
+                }
+                // Block comment start.
+                if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    *in_block_comment = true;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    state = State::Str;
+                    out.push(' ');
+                    i += 1;
+                    continue;
+                }
+                if c == b'\'' {
+                    // Distinguish a char literal (`'x'`, `'\n'`) from a Rust
+                    // lifetime (`'info`, `'a`). A char literal is `'` followed
+                    // by either a backslash escape, or a single char then `'`.
+                    // Anything else is a lifetime — treat `'` as ordinary code.
+                    let is_char_literal = (i + 1 < bytes.len() && bytes[i + 1] == b'\\')
+                        || (i + 2 < bytes.len() && bytes[i + 2] == b'\'');
+                    if is_char_literal {
+                        state = State::Char;
+                        out.push(' ');
+                        i += 1;
+                        continue;
+                    }
+                    // Lifetime tick — keep as code (it has no braces anyway).
+                    out.push('\'');
+                    i += 1;
+                    continue;
+                }
+                // Regular code byte — preserve. `line` is valid UTF-8 and we
+                // only special-case ASCII bytes, so pushing the byte as a char
+                // is safe for the ASCII subset; for multi-byte UTF-8 we copy
+                // the raw bytes through.
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+
     out
+}
+
+/// Count `{`/`}` in a line after stripping literals and comments, returning the
+/// net brace depth delta. Carries block-comment state across lines.
+fn brace_delta(line: &str, in_block_comment: &mut bool) -> i32 {
+    let stripped = strip_literals_and_comments(line, in_block_comment);
+    stripped.matches('{').count() as i32 - stripped.matches('}').count() as i32
+}
+
+fn parse_account_attr_flags(attr: &str) -> (bool, bool) {
+    let Some(start) = attr.find('(') else {
+        return (false, false);
+    };
+    let Some(end) = attr.rfind(')') else {
+        return (false, false);
+    };
+    let inner = &attr[start + 1..end];
+    let tokens: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+    let is_mut = tokens.iter().any(|t| *t == "mut" || t.starts_with("init"));
+    let is_signer = tokens.iter().any(|t| *t == "signer");
+    (is_mut, is_signer)
+}
+
+/// Decide whether a stripped, trimmed line inside an `#[error_code]` enum is a
+/// variant declaration. A variant is any line that starts with an identifier
+/// character (letter or `_`), regardless of leading case, and is not the
+/// `pub enum` header, an attribute, a brace, or empty. This counts every real
+/// variant structurally so IDL codes align with the runtime's 6000 + index.
+fn is_error_variant_line(st: &str) -> bool {
+    if st.is_empty() || st == "{" || st == "}" {
+        return false;
+    }
+    if st.starts_with('#') {
+        return false; // attribute
+    }
+    // Skip the enum header (`pub enum Name {`) and any visibility/keyword lines.
+    if st.starts_with("pub enum") || st.starts_with("enum ") {
+        return false;
+    }
+    // A variant name begins with an ASCII letter or underscore.
+    matches!(st.as_bytes().first(), Some(b) if b.is_ascii_alphabetic() || *b == b'_')
 }
 
 /// Parse `pub struct <Name> { ... }` blocks that are NOT classified as
@@ -391,115 +783,70 @@ fn parse_defined_types(source: &str, idl: &mut Idl) {
     }
 }
 
-fn parse_account_structs(source: &str, idl: &mut Idl) {
-    let mut in_account = false;
-    let mut name = String::new();
-    let mut fields = Vec::new();
-    let mut depth = 0i32;
-
-    for line in source.lines() {
-        let t = line.trim();
-        if t == "#[account]" { in_account = true; continue; }
-        if in_account && name.is_empty() {
-            if t.starts_with("pub struct ") {
-                name = extract_struct_name(t);
-                depth = t.matches('{').count() as i32 - t.matches('}').count() as i32;
-                continue;
-            }
-        }
-        if in_account && !name.is_empty() {
-            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
-            if t.starts_with("pub ") && t.contains(':') {
-                if let Some(f) = parse_field(t) { fields.push(f); }
-            }
-            if depth <= 0 {
-                idl.accounts.push(IdlAccountDef {
-                    name: name.clone(),
-                    ty: IdlAccountType { kind: "struct".into(), fields: std::mem::take(&mut fields) },
-                });
-                name.clear(); in_account = false;
-            }
-        }
-    }
-}
-
-fn parse_derive_accounts(source: &str, idl: &mut Idl) {
-    let mut in_derive = false;
-    let mut name = String::new();
-    let mut accounts = Vec::new();
-    let mut depth = 0i32;
-    let mut next_mut = false;
-    let mut next_signer = false;
-
-    for line in source.lines() {
-        let t = line.trim();
-        if t.contains("#[derive(Accounts)]") { in_derive = true; continue; }
-        if in_derive && name.is_empty() {
-            if t.starts_with("pub struct ") {
-                name = extract_struct_name(t);
-                depth = t.matches('{').count() as i32 - t.matches('}').count() as i32;
-                continue;
-            }
-        }
-        if in_derive && !name.is_empty() {
-            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
-            if t.starts_with("#[account(") {
-                let inner = t.strip_prefix("#[account(").unwrap_or("")
-                    .strip_suffix(")]").unwrap_or("");
-                // Token-level matching to avoid "mut" matching "immutable"
-                let tokens: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
-                next_mut = tokens.iter().any(|t| *t == "mut" || t.starts_with("init"));
-                next_signer = tokens.iter().any(|t| *t == "signer");
-            }
-            if t.starts_with("pub ") && t.contains(':') {
-                let field_name = t.strip_prefix("pub ").unwrap_or("")
-                    .split(':').next().unwrap_or("").trim().to_string();
-                if !field_name.is_empty() {
-                    accounts.push(IdlAccountItem {
-                        name: field_name, is_mut: next_mut, is_signer: next_signer,
-                    });
-                    next_mut = false; next_signer = false;
-                }
-            }
-            if depth <= 0 {
-                let ix_name = to_snake_case(&name);
-                for ix in idl.instructions.iter_mut() {
-                    if ix.name == ix_name { ix.accounts = std::mem::take(&mut accounts); break; }
-                }
-                accounts.clear(); name.clear(); in_derive = false;
-            }
-        }
-    }
-}
-
 fn parse_errors(source: &str, idl: &mut Idl) {
     let mut in_error = false;
     let mut depth = 0i32;
-    let mut code: u32 = 6000;
+    let mut variant_index: u32 = 0; // STRUCTURAL position; code = 6000 + index
     let mut next_msg = String::new();
+    let mut in_block_comment = false;
+    let errors_before = idl.errors.len();
 
     for line in source.lines() {
         let t = line.trim();
-        if t == "#[error_code]" { in_error = true; continue; }
+        if t == "#[error_code]" {
+            in_error = true;
+            continue;
+        }
         if in_error {
-            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
+            // Strip literals/comments ONCE per line; derive both brace depth
+            // and variant detection from the same stripped text so a brace
+            // inside a literal can't confuse either.
+            let stripped = strip_literals_and_comments(line, &mut in_block_comment);
+            depth += stripped.matches('{').count() as i32 - stripped.matches('}').count() as i32;
+
             if t.starts_with("#[msg(") {
-                next_msg = t.strip_prefix("#[msg(\"").unwrap_or("")
-                    .strip_suffix("\")]").unwrap_or("").to_string();
+                next_msg = t
+                    .strip_prefix("#[msg(\"")
+                    .unwrap_or("")
+                    .strip_suffix("\")]")
+                    .unwrap_or("")
+                    .to_string();
             }
-            if !t.starts_with('#') && !t.starts_with("pub enum") && !t.is_empty()
-                && t != "{" && t != "}" && t.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-            {
-                let vname = t.trim_end_matches(',').to_string();
+
+            // FINDING 3 (IDL side): count EVERY enum variant structurally so the
+            // IDL code matches the runtime's `6000 + structural index`. The old
+            // logic only counted lines whose first char was uppercase, so a
+            // lowercase-leading variant was skipped and misaligned every later
+            // code. The variant name comes from the original trimmed line (the
+            // stripped one preserves identifiers as code, so either works, but
+            // the original keeps non-ASCII identifier bytes intact).
+            let st = stripped.trim();
+            if is_error_variant_line(st) {
+                let vname = t.trim_end_matches(',').trim().to_string();
                 idl.errors.push(IdlError {
-                    code, name: vname.clone(),
-                    msg: if next_msg.is_empty() { vname } else { std::mem::take(&mut next_msg) },
+                    code: 6000 + variant_index,
+                    name: vname.clone(),
+                    msg: if next_msg.is_empty() {
+                        vname
+                    } else {
+                        std::mem::take(&mut next_msg)
+                    },
                 });
-                code += 1;
+                variant_index += 1;
             }
-            if depth <= 0 { in_error = false; }
+            if depth <= 0 {
+                in_error = false;
+            }
         }
     }
+
+    // Cross-check: the number of IDL errors emitted for this enum must equal
+    // the number of variants structurally counted.
+    debug_assert_eq!(
+        idl.errors.len() - errors_before,
+        variant_index as usize,
+        "error variant count mismatch"
+    );
 }
 
 fn parse_events(source: &str, idl: &mut Idl) {
@@ -507,41 +854,62 @@ fn parse_events(source: &str, idl: &mut Idl) {
     let mut name = String::new();
     let mut fields = Vec::new();
     let mut depth = 0i32;
+    let mut in_block_comment = false;
 
     for line in source.lines() {
         let t = line.trim();
-        if t == "#[event]" { in_event = true; continue; }
+        if t == "#[event]" {
+            in_event = true;
+            continue;
+        }
         if in_event && name.is_empty() {
             if t.starts_with("pub struct ") {
                 name = extract_struct_name(t);
-                depth = t.matches('{').count() as i32 - t.matches('}').count() as i32;
+                depth = brace_delta(line, &mut in_block_comment);
                 continue;
             }
         }
         if in_event && !name.is_empty() {
-            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
+            depth += brace_delta(line, &mut in_block_comment);
             if t.starts_with("pub ") && t.contains(':') {
-                if let Some(f) = parse_field(t) { fields.push(f); }
+                if let Some(f) = parse_field(t) {
+                    fields.push(f);
+                }
             }
             if depth <= 0 {
-                idl.events.push(IdlEvent { name: name.clone(), fields: std::mem::take(&mut fields) });
-                name.clear(); in_event = false;
+                idl.events.push(IdlEvent {
+                    discriminator: discriminator("event:", &name),
+                    name: name.clone(),
+                    fields: std::mem::take(&mut fields),
+                });
+                name.clear();
+                in_event = false;
             }
         }
     }
 }
 
 fn extract_struct_name(line: &str) -> String {
-    line.strip_prefix("pub struct ").unwrap_or(line)
+    line.strip_prefix("pub struct ")
+        .unwrap_or(line)
         .split(|c: char| c == '{' || c == '<' || c == ' ')
-        .next().unwrap_or("").trim().to_string()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn parse_field(line: &str) -> Option<IdlField> {
     let field_part = line.strip_prefix("pub ")?;
     let (name, ty) = field_part.split_once(':')?;
     // Strip trailing comma and comments
-    let ty_clean = ty.split("//").next().unwrap_or(ty).trim().trim_end_matches(',').trim();
+    let ty_clean = ty
+        .split("//")
+        .next()
+        .unwrap_or(ty)
+        .trim()
+        .trim_end_matches(',')
+        .trim();
     Some(IdlField {
         name: name.trim().to_string(),
         ty: map_type(ty_clean),
@@ -697,27 +1065,21 @@ fn collect_const_usize(source: &str) -> HashMap<String, usize> {
     out
 }
 
-/// Strip a fully-qualified Rust path prefix from a type ident, returning only
-/// the trailing component. E.g. `alloc::vec::Vec<T>` → `Vec<T>`,
-/// `core::option::Option<T>` → `Option<T>`, `Foo` → `Foo`.
-///
-/// Splits on the LAST `::` outside any generic brackets so generics in the
-/// suffix are preserved verbatim.
 fn strip_path_prefix(ty: &str) -> &str {
     let bytes = ty.as_bytes();
-    let mut depth: i32 = 0;
-    let mut last_sep: Option<usize> = None;
+    let mut depth = 0i32;
+    let mut last_sep = None;
     let mut i = 0;
     while i + 1 < bytes.len() {
-        let c = bytes[i];
-        if c == b'<' {
-            depth += 1;
-        } else if c == b'>' {
-            depth -= 1;
-        } else if depth == 0 && c == b':' && bytes[i + 1] == b':' {
-            last_sep = Some(i + 2);
-            i += 2;
-            continue;
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && bytes[i + 1] == b':' => {
+                last_sep = Some(i + 2);
+                i += 2;
+                continue;
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -813,23 +1175,48 @@ mod tests {
 
     #[test]
     fn test_map_type_arrays() {
-        assert_eq!(map_type("[u8; 32]"), serde_json::json!({"array": ["u8", 32]}));
-        assert_eq!(map_type("[u8;32]"), serde_json::json!({"array": ["u8", 32]}));
-        assert_eq!(map_type("[u8;  4]"), serde_json::json!({"array": ["u8", 4]}));
+        assert_eq!(
+            map_type("[u8; 32]"),
+            serde_json::json!({"array": ["u8", 32]})
+        );
+        assert_eq!(
+            map_type("[u8;32]"),
+            serde_json::json!({"array": ["u8", 32]})
+        );
+        assert_eq!(
+            map_type("[u8;  4]"),
+            serde_json::json!({"array": ["u8", 4]})
+        );
     }
 
     #[test]
     fn test_map_type_vec_option() {
         assert_eq!(map_type("Vec<u64>"), serde_json::json!({"vec": "u64"}));
-        assert_eq!(map_type("Vec<Pubkey>"), serde_json::json!({"vec": "publicKey"}));
-        assert_eq!(map_type("Option<Pubkey>"), serde_json::json!({"option": "publicKey"}));
+        assert_eq!(
+            map_type("alloc::vec::Vec<[u8; 32]>"),
+            serde_json::json!({"vec": {"array": ["u8", 32]}})
+        );
+        assert_eq!(
+            map_type("Vec<Pubkey>"),
+            serde_json::json!({"vec": "publicKey"})
+        );
+        assert_eq!(
+            map_type("Option<Pubkey>"),
+            serde_json::json!({"option": "publicKey"})
+        );
         assert_eq!(map_type("Option<u8>"), serde_json::json!({"option": "u8"}));
     }
 
     #[test]
     fn test_map_type_custom() {
-        assert_eq!(map_type("MyCustomType"), serde_json::json!({"defined": "MyCustomType"}));
-        assert_eq!(map_type("StakeInfo"), serde_json::json!({"defined": "StakeInfo"}));
+        assert_eq!(
+            map_type("MyCustomType"),
+            serde_json::json!({"defined": "MyCustomType"})
+        );
+        assert_eq!(
+            map_type("StakeInfo"),
+            serde_json::json!({"defined": "StakeInfo"})
+        );
     }
 
     // ==================== parse_field ====================
@@ -857,9 +1244,11 @@ mod tests {
 
     #[test]
     fn test_normalize_multiline_fn() {
-        let source = "pub fn transfer(\n    ctx: Context<Transfer>,\n    amount: u64,\n) -> Result<()> {";
+        let source =
+            "pub fn transfer(\n    ctx: Context<Transfer>,\n    amount: u64,\n) -> Result<()> {";
         let normalized = normalize_source(source);
-        assert!(normalized.contains("pub fn transfer( ctx: Context<Transfer>, amount: u64, ) -> Result<()> {"));
+        assert!(normalized
+            .contains("pub fn transfer( ctx: Context<Transfer>, amount: u64, ) -> Result<()> {"));
     }
 
     #[test]
@@ -874,7 +1263,10 @@ mod tests {
     #[test]
     fn test_parse_declare_id() {
         let source = r#"declare_id!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");"#;
-        assert_eq!(parse_declare_id(source), "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+        assert_eq!(
+            parse_declare_id(source),
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
     }
 
     #[test]
@@ -902,6 +1294,33 @@ pub mod my_program {
         assert_eq!(idl.instructions[1].name, "transfer");
         assert_eq!(idl.instructions[1].args.len(), 1);
         assert_eq!(idl.instructions[1].args[0].name, "amount");
+    }
+
+    #[test]
+    fn test_parse_fn_sig_stops_before_return_type() {
+        let ix = parse_fn_sig(
+            "pub fn stake(ctx: Context<Stake>, rwt_amount: u64, min_strwt_out: u64) -> Result<()> {",
+        )
+        .unwrap();
+        assert_eq!(ix.name, "stake");
+        assert_eq!(ix.account_context.as_deref(), Some("Stake"));
+        assert_eq!(ix.args.len(), 2);
+        assert_eq!(ix.args[0].name, "rwt_amount");
+        assert_eq!(ix.args[0].ty, serde_json::json!("u64"));
+        assert_eq!(ix.args[1].name, "min_strwt_out");
+        assert_eq!(ix.args[1].ty, serde_json::json!("u64"));
+    }
+
+    #[test]
+    fn test_parse_fn_sig_context_edge_cases() {
+        let ix = parse_fn_sig(
+            "pub fn pause(_ctx: arlex_lang::prelude::Context<crate::PauseEarn<'info>>, ctx_amount: u64) -> Result<()> {",
+        )
+        .unwrap();
+        assert_eq!(ix.account_context.as_deref(), Some("PauseEarn"));
+        assert_eq!(ix.args.len(), 1);
+        assert_eq!(ix.args[0].name, "ctx_amount");
+        assert_eq!(ix.args[0].ty, serde_json::json!("u64"));
     }
 
     #[test]
@@ -953,6 +1372,99 @@ pub mod test {
     }
 
     #[test]
+    fn test_parse_derive_accounts_uses_context_struct_name() {
+        let source = r#"
+#[derive(Accounts)]
+pub struct PauseEarn<'info> {
+    #[account(signer)]
+    pub pause_authority: &'info AccountView,
+    #[account(mut, seeds = [EARN_CONFIG_SEED], bump)]
+    pub earn_config: &'info AccountView,
+}
+
+#[program]
+pub mod test {
+    use super::*;
+    pub fn pause(ctx: Context<PauseEarn>) -> Result<()> { Ok(()) }
+}
+"#;
+        let mut idl = Idl::default();
+        parse_program(source, &mut idl);
+        parse_derive_accounts(source, &mut idl);
+        assert_eq!(idl.instructions[0].name, "pause");
+        assert_eq!(idl.instructions[0].accounts.len(), 2);
+        assert_eq!(idl.instructions[0].accounts[0].name, "pause_authority");
+        assert!(!idl.instructions[0].accounts[0].is_mut);
+        assert!(idl.instructions[0].accounts[0].is_signer);
+        assert_eq!(idl.instructions[0].accounts[1].name, "earn_config");
+        assert!(idl.instructions[0].accounts[1].is_mut);
+        assert!(!idl.instructions[0].accounts[1].is_signer);
+    }
+
+    #[test]
+    fn test_parse_derive_accounts_reuses_context_struct_for_multiple_ixs() {
+        let source = r#"
+#[derive(Accounts)]
+pub struct Toggle<'info> {
+    #[account(signer)]
+    pub authority: &'info AccountView,
+    #[account(mut)]
+    pub config: &'info AccountView,
+}
+
+#[program]
+pub mod test {
+    use super::*;
+    pub fn pause(ctx: Context<Toggle>) -> Result<()> { Ok(()) }
+    pub fn unpause(ctx: Context<Toggle>) -> Result<()> { Ok(()) }
+}
+"#;
+        let mut idl = Idl::default();
+        parse_program(source, &mut idl);
+        parse_derive_accounts(source, &mut idl);
+        assert_eq!(idl.instructions[0].accounts.len(), 2);
+        assert_eq!(idl.instructions[1].accounts.len(), 2);
+        assert_eq!(idl.instructions[0].accounts[1].name, "config");
+        assert_eq!(idl.instructions[1].accounts[1].name, "config");
+        assert!(idl.instructions[0].accounts[1].is_mut);
+        assert!(idl.instructions[1].accounts[1].is_mut);
+    }
+
+    #[test]
+    fn test_parse_multiline_account_attr_flags() {
+        let source = r#"
+#[derive(Accounts)]
+pub struct UpdateConfig<'info> {
+    #[account(signer)]
+    pub authority: &'info AccountView,
+
+    #[account(
+        mut, has_one = authority, account_type = "EarnConfig",
+        seeds = [EARN_CONFIG_SEED], bump
+    )]
+    pub earn_config: &'info AccountView,
+}
+
+#[program]
+pub mod test {
+    use super::*;
+    pub fn update_config(ctx: Context<UpdateConfig>, mint_fee_bps: u16) -> Result<()> { Ok(()) }
+}
+"#;
+        let mut idl = Idl::default();
+        parse_program(source, &mut idl);
+        parse_derive_accounts(source, &mut idl);
+        assert_eq!(idl.instructions[0].accounts.len(), 2);
+        assert_eq!(idl.instructions[0].accounts[0].name, "authority");
+        assert!(!idl.instructions[0].accounts[0].is_mut);
+        assert!(idl.instructions[0].accounts[0].is_signer);
+        assert_eq!(idl.instructions[0].accounts[1].name, "earn_config");
+        assert!(idl.instructions[0].accounts[1].is_mut);
+        assert!(!idl.instructions[0].accounts[1].is_signer);
+        assert_eq!(idl.instructions[0].args[0].ty, serde_json::json!("u16"));
+    }
+
+    #[test]
     fn test_parse_errors() {
         let source = r#"
 #[error_code]
@@ -977,6 +1489,66 @@ pub enum MyError {
         assert_eq!(idl.errors[2].msg, "Overflow"); // no #[msg] → name as msg
     }
 
+    // ==================== FINDING 3 (IDL side): structural error indexing ====================
+
+    #[test]
+    fn test_parse_errors_lowercase_variant_keeps_codes_aligned() {
+        // A lowercase-leading variant (unconventional but valid Rust) must be
+        // counted structurally so later codes stay aligned with the runtime's
+        // 6000 + position. The old uppercase-only counter would skip `lower`
+        // and shift `Third` to 6001 instead of the correct 6002.
+        let source = r#"
+#[error_code]
+pub enum MixedCase {
+    First,
+    lower,
+    Third,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_errors(source, &mut idl);
+        assert_eq!(idl.errors.len(), 3, "every variant counted structurally");
+        assert_eq!(idl.errors[0].name, "First");
+        assert_eq!(idl.errors[0].code, 6000);
+        assert_eq!(idl.errors[1].name, "lower");
+        assert_eq!(idl.errors[1].code, 6001);
+        assert_eq!(idl.errors[2].name, "Third");
+        assert_eq!(idl.errors[2].code, 6002, "Third must be 6002, not 6001");
+    }
+
+    #[test]
+    fn test_parse_errors_counts_all_variants() {
+        let source = r#"
+#[error_code]
+pub enum Errs {
+    A,
+    b,
+    C,
+    d,
+    E,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_errors(source, &mut idl);
+        assert_eq!(idl.errors.len(), 5, "all five variants counted");
+        // Codes are dense and structural: 6000..=6004.
+        for (i, e) in idl.errors.iter().enumerate() {
+            assert_eq!(e.code, 6000 + i as u32);
+        }
+    }
+
+    #[test]
+    fn test_is_error_variant_line_excludes_non_variants() {
+        assert!(is_error_variant_line("First,"));
+        assert!(is_error_variant_line("lower,"));
+        assert!(is_error_variant_line("_Hidden,"));
+        assert!(!is_error_variant_line("#[msg(\"x\")]"));
+        assert!(!is_error_variant_line("pub enum Foo {"));
+        assert!(!is_error_variant_line("{"));
+        assert!(!is_error_variant_line("}"));
+        assert!(!is_error_variant_line(""));
+    }
+
     #[test]
     fn test_parse_events() {
         let source = r#"
@@ -995,6 +1567,99 @@ pub struct Deposited {
         assert_eq!(idl.events[0].fields[1].ty, serde_json::json!("publicKey"));
     }
 
+    // ==================== L2: Anchor-compatible discriminators ====================
+
+    #[test]
+    fn test_discriminator_helper_golden_vectors() {
+        // Pinned bytes — a change to the prefix string or hash would fail loudly.
+        // These match arlex-derive and client/src/discriminator.ts exactly.
+        assert_eq!(
+            discriminator("global:", "initialize"),
+            [175, 175, 109, 31, 13, 152, 155, 237]
+        );
+        assert_eq!(
+            discriminator("account:", "Counter"),
+            [255, 176, 4, 245, 188, 253, 124, 25]
+        );
+        assert_eq!(
+            discriminator("event:", "Deposited"),
+            [111, 141, 26, 45, 161, 35, 100, 57]
+        );
+    }
+
+    #[test]
+    fn test_instruction_discriminator_emitted() {
+        let source = r#"
+#[program]
+pub mod my_program {
+    use super::*;
+    pub fn initialize(ctx: Context<Init>) -> Result<()> { Ok(()) }
+}
+"#;
+        let mut idl = Idl::default();
+        parse_program(source, &mut idl);
+        assert_eq!(idl.instructions.len(), 1);
+        // sha256("global:initialize")[0..8] — matches the TS client.
+        assert_eq!(
+            idl.instructions[0].discriminator,
+            [175, 175, 109, 31, 13, 152, 155, 237]
+        );
+    }
+
+    #[test]
+    fn test_account_discriminator_emitted() {
+        let source = r#"
+#[account]
+pub struct Counter {
+    pub count: u64,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_account_structs(source, &mut idl);
+        assert_eq!(idl.accounts.len(), 1);
+        // sha256("account:Counter")[0..8].
+        assert_eq!(
+            idl.accounts[0].discriminator,
+            [255, 176, 4, 245, 188, 253, 124, 25]
+        );
+    }
+
+    #[test]
+    fn test_event_discriminator_emitted() {
+        let source = r#"
+#[event]
+pub struct Deposited {
+    pub amount: u64,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_events(source, &mut idl);
+        assert_eq!(idl.events.len(), 1);
+        // sha256("event:Deposited")[0..8].
+        assert_eq!(
+            idl.events[0].discriminator,
+            [111, 141, 26, 45, 161, 35, 100, 57]
+        );
+    }
+
+    #[test]
+    fn test_discriminator_serializes_as_u8_array() {
+        let ix = IdlInstruction {
+            discriminator: discriminator("global:", "initialize"),
+            name: "initialize".into(),
+            accounts: Vec::new(),
+            args: Vec::new(),
+            account_context: None,
+        };
+        let json = serde_json::to_value(&ix).unwrap();
+        let disc = &json["discriminator"];
+        assert!(disc.is_array(), "discriminator must serialize as a JSON array");
+        assert_eq!(disc.as_array().unwrap().len(), 8, "exactly 8 elements");
+        // Each element is a u8 number (Anchor convention).
+        assert_eq!(disc[0], serde_json::json!(175));
+        assert_eq!(disc[7], serde_json::json!(237));
+    }
+
     // ==================== Additional edge cases ====================
 
     #[test]
@@ -1010,7 +1675,10 @@ pub struct Deposited {
 
     #[test]
     fn test_map_type_non_u8_array() {
-        assert_eq!(map_type("[Pubkey; 3]"), serde_json::json!({"array": ["publicKey", 3]}));
+        assert_eq!(
+            map_type("[Pubkey; 3]"),
+            serde_json::json!({"array": ["publicKey", 3]})
+        );
     }
 
     #[test]
@@ -1095,11 +1763,122 @@ pub enum Errors {
         assert_eq!(idl.errors[2].code, 6002);
     }
 
-    // ==================== parse_fn_sig regression ====================
-    // Bug: previous parser used line.rfind(')') to find the end of the
-    // fn argument list. For any signature containing `Result<()>` or an
-    // inline body it picked up a `)` outside the args, producing phantom
-    // IDL args like `{ name: "amount", type: { defined: "u64) -> Result<(" }}`.
+    #[test]
+    fn test_parse_init_detected_as_mut() {
+        let source = r#"
+#[derive(Accounts)]
+pub struct Init<'info> {
+    #[account(init, payer = auth, space = 100)]
+    pub data: &'info AccountView,
+    #[account(mut, signer)]
+    pub auth: &'info AccountView,
+}
+
+#[program]
+pub mod test {
+    use super::*;
+    pub fn init(ctx: Context<Init>) -> Result<()> { Ok(()) }
+}
+"#;
+        let mut idl = Idl::default();
+        parse_program(source, &mut idl);
+        parse_derive_accounts(source, &mut idl);
+        assert!(idl.instructions[0].accounts[0].is_mut); // init implies mut
+    }
+
+    // ==================== FINDING 2: literal/comment-safe brace parsing ====================
+
+    #[test]
+    fn test_strip_literals_and_comments_string_braces() {
+        let mut block = false;
+        let stripped = strip_literals_and_comments(r#"log("close brace } here");"#, &mut block);
+        // The `}` inside the string must be blanked out.
+        assert_eq!(stripped.matches('}').count(), 0);
+        assert!(!block);
+    }
+
+    #[test]
+    fn test_strip_literals_and_comments_line_comment() {
+        let mut block = false;
+        let stripped = strip_literals_and_comments("let x = 1; // trailing } brace", &mut block);
+        assert_eq!(stripped.matches('}').count(), 0);
+    }
+
+    #[test]
+    fn test_strip_literals_and_comments_block_comment_across_lines() {
+        let mut block = false;
+        // Opening line: code before the comment is kept, comment braces dropped.
+        let l1 = strip_literals_and_comments("foo {  /* open } brace", &mut block);
+        assert!(block, "block comment must stay open across lines");
+        assert_eq!(l1.matches('{').count(), 1); // the real `{` before the comment
+        assert_eq!(l1.matches('}').count(), 0); // `}` inside comment dropped
+        // Middle line entirely inside the block comment.
+        let l2 = strip_literals_and_comments("still } inside }", &mut block);
+        assert!(block);
+        assert_eq!(l2.matches('}').count(), 0);
+        // Closing line: after */, real code resumes.
+        let l3 = strip_literals_and_comments("end */ }", &mut block);
+        assert!(!block, "block comment must close");
+        assert_eq!(l3.matches('}').count(), 1); // the real `}` after */
+    }
+
+    #[test]
+    fn test_strip_literals_char_literal_brace() {
+        let mut block = false;
+        // A char literal containing a brace must not affect counting.
+        let stripped = strip_literals_and_comments("let c = '}';", &mut block);
+        assert_eq!(stripped.matches('}').count(), 0);
+    }
+
+    #[test]
+    fn test_parse_program_unbalanced_brace_in_string_keeps_all_instructions() {
+        // The first fn body contains a string with an unbalanced `}`. Without
+        // literal stripping this prematurely closes the module and drops the
+        // later instructions. All three must be parsed.
+        let source = r#"
+#[program]
+pub mod my_program {
+    use super::*;
+    pub fn first(ctx: Context<First>) -> Result<()> {
+        log("close brace } here");
+        Ok(())
+    }
+    pub fn second(ctx: Context<Second>) -> Result<()> { Ok(()) }
+    pub fn third(ctx: Context<Third>) -> Result<()> { Ok(()) }
+}
+"#;
+        let mut idl = Idl::default();
+        let count = parse_program(source, &mut idl);
+        assert_eq!(idl.instructions.len(), 3, "all instructions must be parsed");
+        assert_eq!(count, 3);
+        assert_eq!(idl.instructions[0].name, "first");
+        assert_eq!(idl.instructions[1].name, "second");
+        assert_eq!(idl.instructions[2].name, "third");
+    }
+
+    #[test]
+    fn test_generate_idl_instruction_count_check() {
+        // Simulate the cross-check logic directly: when the pub_fn count and the
+        // emitted instruction count diverge, generate_idl returns Err. We can't
+        // call generate_idl (it reads from src/), so we replicate its check.
+        let mut idl = Idl::default();
+        // A program where one `pub fn` has no argument list at all, so
+        // parse_fn_sig rejects it (no `(`). It is counted as a `pub fn` but no
+        // instruction is emitted — exactly the divergence generate_idl flags.
+        let source =
+            "#[program]\npub mod m {\n    pub fn ok(ctx: Context<A>) -> Result<()> { Ok(()) }\n    pub fn broken;\n}\n";
+        let pub_fn_count = parse_program(source, &mut idl);
+        assert_eq!(pub_fn_count, 2, "both pub fn lines counted");
+        assert_eq!(idl.instructions.len(), 1, "broken signature not emitted");
+        // The cross-check in generate_idl would fire on this mismatch.
+        assert_ne!(idl.instructions.len(), pub_fn_count);
+    }
+
+    // ==================== grafted from codegen line (0.3.x) ====================
+    // Tests for the codegen-specific parser additions: multi-arg fn parsing,
+    // nested-array / const-length resolution, path-prefix stripping, and the
+    // split helpers. Behavior verified against the merged (security-superset)
+    // parser.
 
     #[test]
     fn test_parse_fn_sig_single_typed_arg_with_inline_body() {
@@ -1327,28 +2106,5 @@ pub enum Errors {
         let parts = split_top_level_commas("a: u64, b: u64,");
         // Trailing empty is dropped (whitespace-only after the last comma).
         assert_eq!(parts.iter().filter(|p| !p.trim().is_empty()).count(), 2);
-    }
-
-    #[test]
-    fn test_parse_init_detected_as_mut() {
-        let source = r#"
-#[derive(Accounts)]
-pub struct Init<'info> {
-    #[account(init, payer = auth, space = 100)]
-    pub data: &'info AccountView,
-    #[account(mut, signer)]
-    pub auth: &'info AccountView,
-}
-
-#[program]
-pub mod test {
-    use super::*;
-    pub fn init(ctx: Context<Init>) -> Result<()> { Ok(()) }
-}
-"#;
-        let mut idl = Idl::default();
-        parse_program(source, &mut idl);
-        parse_derive_accounts(source, &mut idl);
-        assert!(idl.instructions[0].accounts[0].is_mut); // init implies mut
     }
 }

@@ -38,26 +38,46 @@ export function serializeArgs(fields: IdlField[], values: Record<string, any>, r
   return Buffer.concat(buffers);
 }
 
+// Guard against fractional JS numbers silently flooring through Buffer.writeIntN.
+function assertInteger(value: any, type: string): void {
+  if (!Number.isInteger(value)) {
+    throw new Error(`Expected integer for ${type}, got ${value}`);
+  }
+}
+
+// Convert a value to bigint for 64/128-bit fields without silently losing
+// precision: a JS number above 2^53 is already imprecise before BigInt sees it.
+function toBigIntSafe(value: any, type: string): bigint {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`Unsafe integer for ${type}: ${value} exceeds 2^53; pass a bigint instead`);
+    }
+    return BigInt(value);
+  }
+  return BigInt(value);
+}
+
 function serializeType(type: IdlType, value: any, registry?: TypeRegistry): Buffer {
   if (typeof type === 'string') {
     switch (type) {
-      case 'u8': { const b = Buffer.alloc(1); b.writeUInt8(value); return b; }
-      case 'i8': { const b = Buffer.alloc(1); b.writeInt8(value); return b; }
-      case 'u16': { const b = Buffer.alloc(2); b.writeUInt16LE(value); return b; }
-      case 'i16': { const b = Buffer.alloc(2); b.writeInt16LE(value); return b; }
-      case 'u32': { const b = Buffer.alloc(4); b.writeUInt32LE(value); return b; }
-      case 'i32': { const b = Buffer.alloc(4); b.writeInt32LE(value); return b; }
-      case 'u64': { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(value)); return b; }
-      case 'i64': { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(value)); return b; }
+      case 'u8': { assertInteger(value, 'u8'); const b = Buffer.alloc(1); b.writeUInt8(value); return b; }
+      case 'i8': { assertInteger(value, 'i8'); const b = Buffer.alloc(1); b.writeInt8(value); return b; }
+      case 'u16': { assertInteger(value, 'u16'); const b = Buffer.alloc(2); b.writeUInt16LE(value); return b; }
+      case 'i16': { assertInteger(value, 'i16'); const b = Buffer.alloc(2); b.writeInt16LE(value); return b; }
+      case 'u32': { assertInteger(value, 'u32'); const b = Buffer.alloc(4); b.writeUInt32LE(value); return b; }
+      case 'i32': { assertInteger(value, 'i32'); const b = Buffer.alloc(4); b.writeInt32LE(value); return b; }
+      case 'u64': { const b = Buffer.alloc(8); b.writeBigUInt64LE(toBigIntSafe(value, 'u64')); return b; }
+      case 'i64': { const b = Buffer.alloc(8); b.writeBigInt64LE(toBigIntSafe(value, 'i64')); return b; }
       case 'u128': {
-        const n = BigInt(value);
+        const n = toBigIntSafe(value, 'u128');
         const b = Buffer.alloc(16);
         b.writeBigUInt64LE(n & BigInt('0xFFFFFFFFFFFFFFFF'), 0);
         b.writeBigUInt64LE(n >> BigInt(64), 8);
         return b;
       }
       case 'i128': {
-        const n = BigInt(value);
+        const n = toBigIntSafe(value, 'i128');
         const b = Buffer.alloc(16);
         b.writeBigUInt64LE(n & BigInt('0xFFFFFFFFFFFFFFFF'), 0);
         b.writeBigInt64LE(n >> BigInt(64), 8);
@@ -65,7 +85,10 @@ function serializeType(type: IdlType, value: any, registry?: TypeRegistry): Buff
       }
       case 'f32': { const b = Buffer.alloc(4); b.writeFloatLE(value); return b; }
       case 'f64': { const b = Buffer.alloc(8); b.writeDoubleLE(value); return b; }
-      case 'bool': return Buffer.from([value ? 1 : 0]);
+      case 'bool': {
+        if (typeof value !== 'boolean') throw new Error(`Expected boolean, got ${typeof value}`);
+        return Buffer.from([value ? 1 : 0]);
+      }
       case 'publicKey': {
         const pk = value instanceof PublicKey ? value : new PublicKey(value);
         return pk.toBuffer();
@@ -92,15 +115,25 @@ function serializeType(type: IdlType, value: any, registry?: TypeRegistry): Buff
       // Accept Buffer / Uint8Array / number[] / PublicKey (pubkey-classified
       // [u8;32] fields). PublicKey first so its `.toBuffer()` is preferred
       // over the iterable-array fallback.
+      // In all cases reject a length mismatch: silent truncation/zero-padding
+      // would produce a valid-looking but WRONG fixed array (e.g. a
+      // wrong-length pubkey).
       if (value instanceof PublicKey) {
+        const buf = value.toBuffer();
+        if (buf.length !== size) {
+          throw new Error(`Fixed array length mismatch: expected ${size} bytes, got ${buf.length}`);
+        }
         const result = Buffer.alloc(size);
-        value.toBuffer().copy(result, 0, 0, Math.min(32, size));
+        buf.copy(result, 0, 0, size);
         return result;
       }
       if (Buffer.isBuffer(value) || value instanceof Uint8Array || Array.isArray(value)) {
         const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        if (buf.length !== size) {
+          throw new Error(`Fixed array length mismatch: expected ${size} bytes, got ${buf.length}`);
+        }
         const result = Buffer.alloc(size);
-        buf.copy(result, 0, 0, Math.min(buf.length, size));
+        buf.copy(result, 0, 0, size);
         return result;
       }
     }

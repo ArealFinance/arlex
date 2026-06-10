@@ -1,6 +1,6 @@
 [package]
 name = "arlex-derive"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Proc macros for the Arlex Solana framework"
 license = "Apache-2.0"

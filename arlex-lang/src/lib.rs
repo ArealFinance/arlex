@@ -296,6 +296,125 @@ impl<T: ArgsDeserialize> ArgsDeserialize for Option<T> {
 }
 
 // ============================================================
+// RAII account guards (FINDING 1 — aliasing &mut prevention, CPI-compatible)
+//
+// Background: pinocchio's `AccountView::check_borrow_mut()` only READS the
+// borrow flag (returns Ok if the flag == NOT_BORROWED) and never mutates it.
+// Generated `load_mut`/`init` previously called that read-only check and then
+// handed out `&mut Self` from the data pointer. Two `load_mut` of the SAME
+// account both passed the read-only check, producing two live `&mut Self`
+// aliasing the same memory — undefined behavior.
+//
+// Fix (mut path only): `try_borrow_mut()` actually ENGAGES the flag (sets
+// borrow_state = 0) and returns a `RefMut` whose real `Drop` restores
+// NOT_BORROWED. We KEEP that guard alive (no `mem::forget`) by wrapping it in
+// `AccountRefMut`, which exposes the account struct via `Deref`/`DerefMut`.
+// While the guard is live the flag stays engaged, so a second `load_mut` of
+// the SAME account fails (`try_borrow_mut` re-checks and sees the flag is not
+// NOT_BORROWED) — this closes the aliasing `&mut`/`&mut` UB. A `load_mut` of a
+// DIFFERENT account succeeds (its flag is independent).
+//
+// CPI compatibility (why this REPLACES engage-and-forget): a handler that
+// loads an account mutably and later passes that SAME account into a CPI — as
+// a PDA signer or a writable account — needs the borrow flag RELEASED before
+// the CPI. The checked CPI invoke rejects a read-only account that is mutably
+// borrowed and a writable account that is borrowed in any form. The previous
+// `engage_borrow_mut` leaked the guard via `mem::forget`, so the flag stayed
+// engaged for the whole instruction and that CPI failed with
+// AccountBorrowFailed at runtime (bricking the PDA-as-CPI-signer pattern used
+// by token-vault::withdraw and the contracts' PDA-authority transfers). With
+// an RAII guard the handler simply drops (or scopes) the guard — copying out
+// any needed fields/bump first — before the CPI, and the flag is restored.
+//
+// Read path is deliberately NON-engaging. The generated immutable `load` uses
+// the read-only `check_borrow` (verifies the account is not currently mutably
+// borrowed but does NOT engage the flag) and returns `&'a Self`. Engaging the
+// read path would leak a shared-borrow decrement and make a subsequent
+// `load_mut` of the SAME account fail with AccountBorrowFailed, breaking the
+// legitimate read-then-mutate-same-account pattern (used by several native-dex
+// handlers: add_liquidity, zap_liquidity, compress_liquidity, grow_liquidity,
+// compound_yield on pool_state, and the master-pool swap). So `load` does not
+// engage and must NOT be converted to an engaging guard.
+//
+// Documented residual: an immutable ref returned by `load` that is held live
+// across a `load_mut` of the same account is the same `&T` / `&mut T` window
+// that existed before this fix and is the accepted tradeoff. The dangerous
+// case — two `&mut T` aliasing the same account — is what this fix closes.
+// ============================================================
+
+/// RAII guard returned by generated `load_mut`/`init`.
+///
+/// Holds the live pinocchio `RefMut<[u8]>` obtained from
+/// `AccountView::try_borrow_mut()` (which engaged the mutable borrow flag,
+/// setting `borrow_state = 0`) together with a typed pointer into the account
+/// data past the 8-byte discriminator. The account struct `T` is reached via
+/// `Deref`/`DerefMut`, so `guard.field` reads and writes work transparently.
+///
+/// When the guard is dropped, the held `RefMut`'s `Drop` restores the borrow
+/// flag to `NOT_BORROWED`. This is what lets a handler do a subsequent CPI on
+/// the SAME account (as a PDA signer or writable account) after scoping/copying
+/// out of the guard — the checked CPI invoke requires the flag released.
+///
+/// While the guard is live, a second `load_mut` (or `try_account_ref_mut`) of
+/// the same account fails with `AccountBorrowFailed`, preserving FINDING-1's
+/// anti-aliasing guarantee.
+pub struct AccountRefMut<'a, T> {
+    /// Live borrow guard: its `Drop` resets `borrow_state` to NOT_BORROWED.
+    /// Kept private; only its lifetime/Drop matter to callers.
+    _guard: pinocchio::account::RefMut<'a, [u8]>,
+    /// Typed pointer into account data, past the 8-byte discriminator.
+    /// Valid for as long as `_guard` is held (it pins the borrow).
+    ptr: *mut T,
+}
+
+impl<'a, T> core::ops::Deref for AccountRefMut<'a, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // Safety: `ptr` points into the account data region, which `_guard`
+        // keeps exclusively borrowed for the lifetime of `self`. The account
+        // is repr(C, packed) (alignment 1), so the pointer is always aligned.
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<'a, T> core::ops::DerefMut for AccountRefMut<'a, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // Safety: exclusive access is guaranteed by the engaged mutable borrow
+        // held in `_guard`; `&mut self` ensures no other reference exists.
+        unsafe { &mut *self.ptr }
+    }
+}
+
+/// Construct an [`AccountRefMut`] for an account's data at `data_offset`.
+///
+/// Engages the mutable borrow flag via `AccountView::try_borrow_mut()`
+/// (setting `borrow_state = 0`); returns `Err(ProgramError::AccountBorrowFailed)`
+/// if the account is already borrowed in any form. This is what makes a second
+/// mutable load of the SAME account fail instead of producing an aliasing
+/// `&mut` (FINDING-1 closure stays intact while the guard is live).
+///
+/// `data_offset` is the byte offset of the typed struct within the account
+/// data; the generated codegen passes `8` to skip the discriminator.
+///
+/// Unlike the removed `engage_borrow_mut`, the borrow guard is NOT leaked: it
+/// is held inside the returned `AccountRefMut` and its `Drop` restores the flag
+/// to NOT_BORROWED, so a later CPI on the same account succeeds once the guard
+/// is dropped/scoped.
+#[inline]
+pub fn try_account_ref_mut<T>(
+    account: &AccountView,
+    data_offset: usize,
+) -> core::result::Result<AccountRefMut<'_, T>, ProgramError> {
+    // Engages the flag (state = 0); fails if already borrowed in any form.
+    let guard = account.try_borrow_mut()?;
+    // Typed pointer past the discriminator. `data_ptr()` is the data start.
+    let ptr = unsafe { account.data_ptr().add(data_offset) as *mut T };
+    Ok(AccountRefMut { _guard: guard, ptr })
+}
+
+// ============================================================
 // Safe account loading helpers
 // These use byte-by-byte reads to avoid alignment issues.
 // ============================================================
@@ -341,29 +460,22 @@ pub fn write_u32_le(data: &mut [u8], offset: usize, val: u32) {
 // ============================================================
 
 /// Find a Program Derived Address.
-/// On SBF: uses the native syscall.
-/// On native: uses the sha256-based derivation for IDE/check compatibility.
-#[cfg(any(target_os = "solana", target_arch = "bpf"))]
+///
+/// This delegates UNCONDITIONALLY to `solana_address::Address::find_program_address`
+/// (the type pinocchio re-exports as `Address`):
+/// - On SBF (`target_os = "solana"` / `target_arch = "bpf"`) it resolves to the
+///   `sol_try_find_program_address` syscall.
+/// - On native it resolves to the real off-chain canonical-bump loop with a
+///   genuine ed25519 off-curve check (curve25519-dalek), enabled by the
+///   native-only `solana-address = { features = ["curve25519"] }` dependency in
+///   Cargo.toml. The result is a CANONICAL PDA — identical to what the runtime
+///   derives — so host `cargo test` validates REAL PDAs, not a fake.
+///
+/// Previously the native branch used a sha256 stub that returned a non-canonical
+/// bump of 255 and an address that did not match the syscall's output; that fake
+/// has been removed.
 pub fn find_program_address(seeds: &[&[u8]], program_id: &Address) -> (Address, u8) {
     Address::find_program_address(seeds, program_id)
-}
-
-#[cfg(not(any(target_os = "solana", target_arch = "bpf")))]
-pub fn find_program_address(seeds: &[&[u8]], _program_id: &Address) -> (Address, u8) {
-    // Native-target implementation for cargo check and IDE support.
-    // Uses sha256-based derivation. On SBF target, the real Solana syscall is used instead.
-    // This is NOT a stub — it produces deterministic addresses for development/testing.
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    for seed in seeds {
-        hasher.update(seed);
-    }
-    hasher.update(_program_id.as_ref());
-    hasher.update(b"ProgramDerivedAddress");
-    let hash = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&hash[..32]);
-    (Address::new_from_array(bytes), 255)
 }
 
 /// Create a PDA account via System Program CPI.
@@ -403,8 +515,12 @@ pub fn create_pda_account<'a>(
     _signer_seeds: &[&[u8]],
     _all_accounts: &[AccountView],
 ) -> core::result::Result<(), ProgramError> {
-    // Native-target implementation — returns Ok(()) for cargo check/IDE.
-    // On SBF target, the real System Program CPI is used instead.
+    // Legitimate host no-op: there is no Solana runtime off-chain, so a CPI
+    // cannot execute. This returns Ok(()) so `cargo check`/IDE/host tests
+    // compile and run; on the SBF target the real System Program CPI above is
+    // used. This is NOT a fake value (unlike the old sha256 find_program_address
+    // stub that has been removed) — it is the absence of a side effect that has
+    // no host equivalent. Do not "fix" this to fabricate account creation.
     Ok(())
 }
 
@@ -702,6 +818,226 @@ pub fn base58_decode(input: &str) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::math::*;
+
+    // ---- FINDING 1: borrow-flag engagement (aliasing &mut prevention) ----
+
+    use pinocchio::account::{RuntimeAccount, NOT_BORROWED};
+
+    /// Backing storage for a fabricated `AccountView`: a `RuntimeAccount`
+    /// header immediately followed by `DATA` bytes of account data, matching
+    /// the runtime's in-memory layout. Over-aligned to `RuntimeAccount`.
+    #[repr(C, align(8))]
+    struct FakeAccount {
+        header: RuntimeAccount,
+        data: [u8; 64],
+    }
+
+    impl FakeAccount {
+        fn new() -> Box<Self> {
+            let mut header = RuntimeAccount::default();
+            // Runtime guarantees the flag is NOT_BORROWED at instruction entry.
+            header.borrow_state = NOT_BORROWED;
+            header.data_len = 64;
+            header.is_writable = 1;
+            Box::new(FakeAccount {
+                header,
+                data: [0u8; 64],
+            })
+        }
+
+        /// Build an `AccountView` pointing at this account's header.
+        ///
+        /// Derive the view pointer from the WHOLE `FakeAccount` allocation so
+        /// it carries provenance over the `data` region the runtime layout
+        /// places immediately after the header. Reborrowing `&mut self.header`
+        /// would narrow provenance to JUST the header bytes, and Miri (strict
+        /// provenance / Stacked Borrows) would then flag the `data` access in
+        /// `try_borrow_mut`, where `data_ptr()` reads past the header into
+        /// `data`. `RuntimeAccount` is the first field of this `#[repr(C)]`
+        /// struct, so the address is identical to `&mut self.header` — this
+        /// only widens provenance, it does not change the pointee.
+        ///
+        /// # Safety
+        /// The returned view borrows from `self`; the `FakeAccount` must
+        /// outlive the view and not be moved while the view is in use.
+        unsafe fn view(&mut self) -> AccountView {
+            let ptr = self as *mut FakeAccount as *mut RuntimeAccount;
+            AccountView::new_unchecked(ptr)
+        }
+    }
+
+    #[test]
+    fn test_account_ref_mut_second_engage_fails() {
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        // First guard succeeds and engages the flag.
+        let g1 = try_account_ref_mut::<u8>(&view, 8)
+            .expect("first try_account_ref_mut must succeed");
+
+        // Second guard of the SAME account must fail while the first is LIVE —
+        // this is the core anti-aliasing guarantee (FINDING-1 closure).
+        assert!(
+            try_account_ref_mut::<u8>(&view, 8).is_err(),
+            "second try_account_ref_mut of same account must fail while first guard is live"
+        );
+
+        // Keep the first guard alive until after the second attempt.
+        let _ = g1;
+    }
+
+    #[test]
+    fn test_account_ref_mut_two_different_accounts_succeed() {
+        let mut a = FakeAccount::new();
+        let mut b = FakeAccount::new();
+        let view_a = unsafe { a.view() };
+        let view_b = unsafe { b.view() };
+
+        // Different accounts have independent flags — both must succeed even
+        // while both guards are live (swap.rs holds two different accounts'
+        // mut handles live simultaneously).
+        let ga = try_account_ref_mut::<u8>(&view_a, 8);
+        let gb = try_account_ref_mut::<u8>(&view_b, 8);
+        assert!(ga.is_ok());
+        assert!(gb.is_ok());
+    }
+
+    #[test]
+    fn test_read_check_then_account_ref_mut_same_account_succeeds() {
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        // REGRESSION TEST for the read-then-mutate-same-account bug.
+        //
+        // The generated immutable `load` uses the NON-ENGAGING read-only
+        // borrow check (`check_borrow`), which only verifies the account is not
+        // currently mutably borrowed and does NOT engage the flag. Replicate
+        // exactly what `load` does, then build the mutable guard on the SAME
+        // account (what a following `load_mut` does). It MUST succeed — this is
+        // the legitimate read-then-mutate-same-account pattern used by several
+        // native-dex handlers (add_liquidity, zap_liquidity, compress_liquidity,
+        // grow_liquidity, compound_yield on pool_state, master-pool swap).
+        view.check_borrow()
+            .expect("non-engaging read check must succeed on a fresh account");
+        let g = try_account_ref_mut::<u8>(&view, 8)
+            .expect("try_account_ref_mut after a non-engaging read check of the SAME account must succeed");
+        let _ = g;
+    }
+
+    #[test]
+    fn guard_releases_flag_so_cpi_borrow_check_passes() {
+        // THE CPI-borrow predicate. This is the test that would FAIL on the
+        // removed engage_borrow_mut (mem::forget) version: that helper engaged
+        // the flag and leaked the guard, so is_borrowed_mut()/is_borrowed()
+        // stayed true for the whole instruction and a subsequent checked CPI
+        // invoke rejected the account (AccountBorrowFailed) — bricking the
+        // PDA-as-CPI-signer pattern. With the RAII guard the flag is engaged
+        // while the guard is live and RELEASED on drop.
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        {
+            let g = try_account_ref_mut::<u8>(&view, 8).unwrap();
+            // While the guard is live the account reads as mutably borrowed.
+            assert!(view.is_borrowed_mut(), "flag must be engaged while guard is live");
+            assert!(view.is_borrowed(), "borrowed-in-any-form must be true while guard is live");
+            let _ = g; // keep the guard alive across the assertions above
+        } // guard drops here — Drop restores NOT_BORROWED
+
+        // After drop, BOTH CPI borrow predicates must pass:
+        // - a read-only CPI account fails if is_borrowed_mut()
+        // - a writable CPI account fails if is_borrowed()
+        assert!(
+            !view.is_borrowed_mut(),
+            "read-only CPI borrow-check must pass after guard drop"
+        );
+        assert!(
+            !view.is_borrowed(),
+            "writable CPI borrow-check must pass after guard drop"
+        );
+
+        // And the released flag lets the account be mutably engaged again,
+        // exactly as a post-CPI re-load would.
+        let g2 = try_account_ref_mut::<u8>(&view, 8);
+        assert!(g2.is_ok(), "re-engaging after the guard dropped must succeed");
+    }
+
+    // ---- L4: real native PDA derivation (sha256 fake removed) ----
+    //
+    // These validate that `find_program_address` on the HOST now produces a
+    // canonical, off-curve PDA identical to the runtime's — not the old sha256
+    // stub that always returned bump 255 and a fabricated address. The proofs
+    // use `Address::create_program_address` (the real off-chain ed25519 check,
+    // available via the native-only `curve25519` feature) for the round-trip.
+
+    /// A fixed seed + program_id derives a canonical bump: re-deriving with
+    /// `create_program_address(seeds ++ [bump], program_id)` reproduces the
+    /// SAME address. The old sha256 fake would fail this round-trip.
+    #[test]
+    fn test_find_program_address_canonical_roundtrip() {
+        let program_id = Address::new_from_array([7u8; 32]);
+        let (pda, bump) = find_program_address(&[b"vault", b"areal"], &program_id);
+
+        let reproduced = Address::create_program_address(
+            &[b"vault", b"areal", &[bump]],
+            &program_id,
+        )
+        .expect("canonical bump must produce a valid PDA on round-trip");
+        assert_eq!(pda, reproduced, "round-trip must reproduce the same PDA");
+    }
+
+    /// The derived PDA must be OFF the ed25519 curve (the defining property of a
+    /// real PDA). `is_on_curve` is available via the native-only curve25519
+    /// feature; the sha256 fake never checked this.
+    #[test]
+    fn test_find_program_address_is_off_curve() {
+        let program_id = Address::new_from_array([3u8; 32]);
+        let (pda, _bump) = find_program_address(&[b"config"], &program_id);
+        assert!(!pda.is_on_curve(), "a real PDA must be off the ed25519 curve");
+    }
+
+    /// The canonical bump for a typical seed is generally NOT 255 (the old fake
+    /// always returned 255). Combined with the round-trip, this proves real
+    /// derivation. We assert the round-trip holds for whatever the canonical
+    /// bump is, and that at least one of a few fixed seeds yields bump != 255.
+    #[test]
+    fn test_find_program_address_bump_is_canonical_not_always_255() {
+        let program_id = Address::new_from_array([42u8; 32]);
+        let seeds_list: [&[&[u8]]; 4] = [
+            &[b"a"],
+            &[b"pool"],
+            &[b"strwt", b"mint"],
+            &[b"areal", b"vault", b"v1"],
+        ];
+        let mut any_non_255 = false;
+        for seeds in seeds_list {
+            let (pda, bump) = find_program_address(seeds, &program_id);
+            // Round-trip every derivation regardless of bump value.
+            let mut with_bump: Vec<&[u8]> = seeds.to_vec();
+            let bump_arr = [bump];
+            with_bump.push(&bump_arr);
+            let reproduced = Address::create_program_address(&with_bump, &program_id)
+                .expect("canonical bump must round-trip");
+            assert_eq!(pda, reproduced);
+            if bump != 255 {
+                any_non_255 = true;
+            }
+        }
+        assert!(
+            any_non_255,
+            "at least one typical seed should yield a canonical bump != 255 \
+             (the old sha256 fake always returned 255)"
+        );
+    }
+
+    /// Two different seeds derive two different addresses.
+    #[test]
+    fn test_find_program_address_distinct_seeds_distinct_addresses() {
+        let program_id = Address::new_from_array([9u8; 32]);
+        let (pda_a, _) = find_program_address(&[b"alpha"], &program_id);
+        let (pda_b, _) = find_program_address(&[b"beta"], &program_id);
+        assert_ne!(pda_a, pda_b, "different seeds must yield different PDAs");
+    }
 
     // ---- Gap 1: u128/i128 ArgsDeserialize ----
 

@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: has_one on `areal_fee_destination` cannot resolve its byte offset because a field of macro-unknown size precedes it in `RevenueConfig` (e.g. a type alias or an array of a user struct). Place pubkey fields used in has_one before any variable/unknown-size field, or validate `areal_fee_destination` manually in the handler instead of via has_one.
+  --> tests/cases/accounts_has_one_unresolvable_offset.rs:29:10
+   |
+29 | #[derive(Accounts)]
+   |          ^^^^^^^^ evaluation of `WithHasOne::<'info>::validate::_` failed here

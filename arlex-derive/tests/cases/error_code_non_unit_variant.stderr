@@ -1,0 +1,5 @@
+error: error_code variants must be unit variants without explicit discriminants (codes are assigned 6000 + position)
+ --> tests/cases/error_code_non_unit_variant.rs:8:5
+  |
+8 |     Beta(u64),
+  |     ^^^^^^^^^

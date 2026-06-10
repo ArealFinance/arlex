@@ -139,6 +139,49 @@ describe('serialization', () => {
       const result = roundtrip(fields, { vals: [BigInt(1), BigInt(2), BigInt(3)] });
       expect(result.vals).toEqual([BigInt(1), BigInt(2), BigInt(3)]);
     });
+
+    // Finding 6: [u8; N] must reject length mismatch instead of silently
+    // truncating/zero-padding (a wrong-length pubkey -> valid-looking WRONG key).
+    it('[u8; 32] exact-length Buffer roundtrips', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      const input = Buffer.alloc(32, 0x7F);
+      const buf = serializeArgs(fields, { key: input });
+      expect(buf.length).toBe(32);
+      const result = roundtrip(fields, { key: input });
+      expect(Buffer.from(result.key)).toEqual(input);
+    });
+
+    it('[u8; 32] exact-length number[] roundtrips', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      const input = Array.from({ length: 32 }, (_, i) => i);
+      const result = roundtrip(fields, { key: input });
+      expect([...result.key]).toEqual(input);
+    });
+
+    it('[u8; 32] longer Buffer (40 bytes) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      expect(() => serializeArgs(fields, { key: Buffer.alloc(40, 0xAB) }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 40');
+    });
+
+    it('[u8; 32] shorter Buffer (4 bytes) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      expect(() => serializeArgs(fields, { key: Buffer.alloc(4) }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 4');
+    });
+
+    it('[u8; 32] longer number[] (40) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      const input = new Array(40).fill(1);
+      expect(() => serializeArgs(fields, { key: input }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 40');
+    });
+
+    it('[u8; 32] shorter number[] (4) throws', () => {
+      const fields: IdlField[] = [{ name: 'key', type: { array: ['u8', 32] } }];
+      expect(() => serializeArgs(fields, { key: [1, 2, 3, 4] }))
+        .toThrow('Fixed array length mismatch: expected 32 bytes, got 4');
+    });
   });
 
   // ==================== Vec ====================
@@ -463,6 +506,80 @@ describe('serialization', () => {
       const fields: IdlField[] = [{ name: 'val', type: 'i32' }];
       const result = roundtrip(fields, { val: -2147483648 });
       expect(result.val).toBe(-2147483648);
+    });
+  });
+
+  // ==================== Coercion guards (Finding 7) ====================
+
+  describe('coercion guards', () => {
+    // Integer types must reject fractional numbers (Buffer.writeIntN silently floors).
+    it('fractional u8 throws', () => {
+      const fields: IdlField[] = [{ name: 'val', type: 'u8' }];
+      expect(() => serializeArgs(fields, { val: 3.9 })).toThrow('Expected integer for u8, got 3.9');
+    });
+
+    it('fractional u32 throws', () => {
+      const fields: IdlField[] = [{ name: 'val', type: 'u32' }];
+      expect(() => serializeArgs(fields, { val: 100.5 })).toThrow('Expected integer for u32, got 100.5');
+    });
+
+    it('fractional i16 throws', () => {
+      const fields: IdlField[] = [{ name: 'val', type: 'i16' }];
+      expect(() => serializeArgs(fields, { val: -7.25 })).toThrow('Expected integer for i16');
+    });
+
+    it('integer small ints still roundtrip', () => {
+      const u8 = roundtrip([{ name: 'val', type: 'u8' }], { val: 200 });
+      expect(u8.val).toBe(200);
+      const i32 = roundtrip([{ name: 'val', type: 'i32' }], { val: -123 });
+      expect(i32.val).toBe(-123);
+    });
+
+    // bool must reject any non-boolean (truthy strings/numbers).
+    it('numeric truthy for bool throws', () => {
+      const fields: IdlField[] = [{ name: 'flag', type: 'bool' }];
+      expect(() => serializeArgs(fields, { flag: 1 })).toThrow('Expected boolean, got number');
+    });
+
+    it('string for bool throws', () => {
+      const fields: IdlField[] = [{ name: 'flag', type: 'bool' }];
+      expect(() => serializeArgs(fields, { flag: 'x' })).toThrow('Expected boolean, got string');
+    });
+
+    it('string "false" for bool throws (not silently truthy)', () => {
+      const fields: IdlField[] = [{ name: 'flag', type: 'bool' }];
+      expect(() => serializeArgs(fields, { flag: 'false' })).toThrow('Expected boolean, got string');
+    });
+
+    it('true/false still roundtrip', () => {
+      expect(roundtrip([{ name: 'flag', type: 'bool' }], { flag: true }).flag).toBe(true);
+      expect(roundtrip([{ name: 'flag', type: 'bool' }], { flag: false }).flag).toBe(false);
+    });
+
+    // 64/128-bit: numbers above 2^53 are already imprecise; require a bigint.
+    it('unsafe number for u64 throws with bigint guidance', () => {
+      const fields: IdlField[] = [{ name: 'val', type: 'u64' }];
+      const unsafe = Number.MAX_SAFE_INTEGER + 10;
+      expect(() => serializeArgs(fields, { val: unsafe }))
+        .toThrow('exceeds 2^53; pass a bigint instead');
+    });
+
+    it('unsafe number for u128 throws with bigint guidance', () => {
+      const fields: IdlField[] = [{ name: 'val', type: 'u128' }];
+      expect(() => serializeArgs(fields, { val: 9007199254740993 }))
+        .toThrow('Unsafe integer for u128');
+    });
+
+    it('safe-integer number for u64 still works', () => {
+      const fields: IdlField[] = [{ name: 'val', type: 'u64' }];
+      const result = roundtrip(fields, { val: 1234567 });
+      expect(result.val).toBe(BigInt(1234567));
+    });
+
+    it('bigint for u64 still works', () => {
+      const fields: IdlField[] = [{ name: 'val', type: 'u64' }];
+      const result = roundtrip(fields, { val: BigInt('18446744073709551615') });
+      expect(result.val).toBe(BigInt('18446744073709551615'));
     });
   });
 
