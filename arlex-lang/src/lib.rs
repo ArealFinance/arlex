@@ -913,6 +913,44 @@ mod tests {
         let _ = g;
     }
 
+    #[test]
+    fn guard_releases_flag_so_cpi_borrow_check_passes() {
+        // THE CPI-borrow predicate. This is the test that would FAIL on the
+        // removed engage_borrow_mut (mem::forget) version: that helper engaged
+        // the flag and leaked the guard, so is_borrowed_mut()/is_borrowed()
+        // stayed true for the whole instruction and a subsequent checked CPI
+        // invoke rejected the account (AccountBorrowFailed) — bricking the
+        // PDA-as-CPI-signer pattern. With the RAII guard the flag is engaged
+        // while the guard is live and RELEASED on drop.
+        let mut acct = FakeAccount::new();
+        let view = unsafe { acct.view() };
+
+        {
+            let g = try_account_ref_mut::<u8>(&view, 8).unwrap();
+            // While the guard is live the account reads as mutably borrowed.
+            assert!(view.is_borrowed_mut(), "flag must be engaged while guard is live");
+            assert!(view.is_borrowed(), "borrowed-in-any-form must be true while guard is live");
+            let _ = g; // keep the guard alive across the assertions above
+        } // guard drops here — Drop restores NOT_BORROWED
+
+        // After drop, BOTH CPI borrow predicates must pass:
+        // - a read-only CPI account fails if is_borrowed_mut()
+        // - a writable CPI account fails if is_borrowed()
+        assert!(
+            !view.is_borrowed_mut(),
+            "read-only CPI borrow-check must pass after guard drop"
+        );
+        assert!(
+            !view.is_borrowed(),
+            "writable CPI borrow-check must pass after guard drop"
+        );
+
+        // And the released flag lets the account be mutably engaged again,
+        // exactly as a post-CPI re-load would.
+        let g2 = try_account_ref_mut::<u8>(&view, 8);
+        assert!(g2.is_ok(), "re-engaging after the guard dropped must succeed");
+    }
+
     // ---- L4: real native PDA derivation (sha256 fake removed) ----
     //
     // These validate that `find_program_address` on the HOST now produces a
