@@ -63,6 +63,8 @@ function mockConnection(overrides: Record<string, any> = {}): Connection {
     sendTransaction: vi.fn(),
     confirmTransaction: vi.fn(),
     getLatestBlockhash: vi.fn().mockResolvedValue({ blockhash: 'test', lastValidBlockHeight: 100 }),
+    getSignatureStatuses: vi.fn().mockResolvedValue({ value: [{ confirmationStatus: 'confirmed', err: null, slot: 1 }] }),
+    getBlockHeight: vi.fn().mockResolvedValue(50),
     simulateTransaction: vi.fn(),
     onAccountChange: vi.fn().mockReturnValue(1),
     removeAccountChangeListener: vi.fn(),
@@ -383,8 +385,8 @@ describe('ArlexClient', () => {
   describe('execute', () => {
     it('sends transaction and returns signature', async () => {
       const sendFn = vi.fn().mockResolvedValue('fakeSig123');
-      const confirmFn = vi.fn().mockResolvedValue({ value: {} });
-      const conn = mockConnection({ sendTransaction: sendFn, confirmTransaction: confirmFn });
+      const statusFn = vi.fn().mockResolvedValue({ value: [{ confirmationStatus: 'confirmed', err: null, slot: 1 }] });
+      const conn = mockConnection({ sendTransaction: sendFn, getSignatureStatuses: statusFn });
       const client = new ArlexClient(testIdl, programId, conn);
 
       const payer = Keypair.generate();
@@ -397,7 +399,7 @@ describe('ArlexClient', () => {
 
       expect(sig).toBe('fakeSig123');
       expect(sendFn).toHaveBeenCalledTimes(1);
-      expect(confirmFn).toHaveBeenCalledWith('fakeSig123', 'confirmed');
+      expect(statusFn).toHaveBeenCalledWith(['fakeSig123']);
     });
 
     it('passes payer + additional signers', async () => {
