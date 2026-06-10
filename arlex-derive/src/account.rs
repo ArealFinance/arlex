@@ -12,12 +12,16 @@ use sha2::{Sha256, Digest};
 /// - Writable check on load_mut
 /// - Uninitialized check on init (discriminator must be all zeros)
 /// - Byte-by-byte field access to avoid alignment UB
-/// - Borrow flag ENGAGED (not merely read) on load_mut/init via
-///   `arlex_lang::engage_borrow_mut`, so a second `load_mut` of the same
-///   account within one instruction fails instead of producing an aliasing
-///   `&mut`/`&mut`. The immutable `load` path uses the NON-ENGAGING
-///   `check_borrow` so the legitimate read-then-mutate-same-account pattern
-///   stays legal. See FINDING 1 in arlex-lang for the full rationale.
+/// - Borrow flag ENGAGED (not merely read) on load_mut/init via the RAII guard
+///   `arlex_lang::AccountRefMut` (constructed by `try_account_ref_mut`), so a
+///   second `load_mut` of the same account fails WHILE the guard is live —
+///   closing the aliasing `&mut`/`&mut` window. Unlike the removed
+///   engage-and-forget helper, the guard's `Drop` RELEASES the borrow flag, so
+///   a handler can scope/drop the guard before a CPI on the same account (PDA
+///   signer or writable) and the checked CPI invoke succeeds. The immutable
+///   `load` path uses the NON-ENGAGING `check_borrow` and returns `&Self` so
+///   the legitimate read-then-mutate-same-account pattern stays legal. See
+///   FINDING 1 in arlex-lang for the full rationale.
 pub fn generate(input: ItemStruct) -> Result<TokenStream> {
     let name = &input.ident;
     let vis = &input.vis;
@@ -150,13 +154,19 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
             /// Load account data (mutable).
             /// Checks: discriminator, size, owner, writable, borrow state.
             ///
-            /// Enforces exclusive access by ENGAGING the mutable borrow flag
-            /// via `arlex_lang::engage_borrow_mut` (which actually sets the
-            /// flag, unlike the read-only `check_borrow_mut`). A second
-            /// `load_mut` (or a `load_mut` after `init`/`load_mut`) of the SAME
-            /// account within the same instruction returns Err instead of
-            /// producing a second aliasing `&mut Self`. `load_mut` of DIFFERENT
-            /// accounts all succeed (their flags are independent).
+            /// Returns an RAII guard `arlex_lang::AccountRefMut<Self>` that
+            /// engages the mutable borrow flag (via `try_account_ref_mut`,
+            /// which actually sets the flag, unlike the read-only
+            /// `check_borrow_mut`). Field reads/writes work through
+            /// `Deref`/`DerefMut`. While the guard is LIVE a second `load_mut`
+            /// (or `load_mut` after `init`/`load_mut`) of the SAME account
+            /// returns Err instead of producing a second aliasing `&mut Self`.
+            /// `load_mut` of DIFFERENT accounts all succeed (independent flags).
+            ///
+            /// The guard's `Drop` RELEASES the borrow flag — drop or scope it
+            /// (copying out any needed fields/bump first) before a CPI that
+            /// passes the same account as a signer or writable, otherwise the
+            /// checked CPI invoke would reject the still-borrowed account.
             ///
             /// Note: a prior `load` (immutable, non-engaging) of the SAME
             /// account does NOT block this `load_mut` — the read path leaves the
@@ -164,7 +174,7 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
             pub fn load_mut<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
-            ) -> core::result::Result<&'a mut Self, pinocchio::error::ProgramError> {
+            ) -> core::result::Result<arlex_lang::AccountRefMut<'a, Self>, pinocchio::error::ProgramError> {
                 // Check writable
                 if !account.is_writable() {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
@@ -183,29 +193,31 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
                 || data[4] != #d4 || data[5] != #d5 || data[6] != #d6 || data[7] != #d7 {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
                 }
-                // Engage the mutable borrow flag for the rest of the instruction.
+                // Engage the mutable borrow flag and return the RAII guard.
                 // Fails (AccountBorrowFailed) if the account is already borrowed,
-                // which closes the aliasing &mut window. The flag stays engaged
-                // (guard leaked) and is reset by the runtime at instruction entry.
-                let data_ptr = arlex_lang::engage_borrow_mut(account)?;
-                // Safety: repr(C, packed) alignment 1. Writable checked above;
-                // exclusive access enforced by the engaged mutable borrow.
-                Ok(unsafe { &mut *(data_ptr.add(8) as *mut Self) })
+                // closing the aliasing &mut window. The flag is RELEASED when the
+                // returned guard is dropped (Self begins at offset 8, after the
+                // 8-byte discriminator). Writable checked above; exclusive access
+                // is enforced by the engaged mutable borrow held in the guard.
+                arlex_lang::try_account_ref_mut::<Self>(account, 8)
             }
 
             /// Initialize: write discriminator to account data.
             /// Checks: writable, size, owner, not already initialized, borrow state.
             ///
-            /// Engages the mutable borrow flag (see `load_mut`) so an `init`
-            /// followed by a `load_mut`/`init`/`load` of the SAME account in one
-            /// instruction returns Err instead of a second aliasing `&mut`
+            /// Returns an RAII guard `arlex_lang::AccountRefMut<Self>` that
+            /// engages the mutable borrow flag (see `load_mut`) so an `init`
+            /// followed by a `load_mut`/`init`/`load` of the SAME account while
+            /// the guard is LIVE returns Err instead of a second aliasing `&mut`
             /// (a following `load`'s read-only `check_borrow` sees the engaged
             /// mut flag and fails — only the reverse order, load-then-load_mut,
-            /// is intentionally allowed via the non-engaging read path).
+            /// is intentionally allowed via the non-engaging read path). The
+            /// guard's `Drop` RELEASES the flag, so a subsequent CPI on the same
+            /// account succeeds once the guard is dropped/scoped.
             pub fn init<'a>(
                 account: &'a pinocchio::AccountView,
                 program_id: &pinocchio::Address,
-            ) -> core::result::Result<&'a mut Self, pinocchio::error::ProgramError> {
+            ) -> core::result::Result<arlex_lang::AccountRefMut<'a, Self>, pinocchio::error::ProgramError> {
                 // Check writable
                 if !account.is_writable() {
                     return Err(pinocchio::error::ProgramError::InvalidAccountData);
@@ -225,19 +237,21 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
                 if !is_zeroed {
                     return Err(pinocchio::error::ProgramError::AccountAlreadyInitialized);
                 }
-                // Engage the mutable borrow flag for the rest of the instruction.
-                // Fails if the account is already borrowed; otherwise stays
-                // engaged (guard leaked) and is reset by the runtime at entry.
-                let ptr = arlex_lang::engage_borrow_mut(account)?;
-                // Write discriminator through the engaged pointer.
+                // Write the discriminator to the first 8 bytes BEFORE engaging
+                // the borrow guard. All preconditions (writable, owner, zeroed)
+                // are already verified; no borrow is held yet, so this direct
+                // write is sound and matches the previous behavior.
+                let base = account.data_ptr();
                 unsafe {
-                    *ptr.add(0) = #d0; *ptr.add(1) = #d1;
-                    *ptr.add(2) = #d2; *ptr.add(3) = #d3;
-                    *ptr.add(4) = #d4; *ptr.add(5) = #d5;
-                    *ptr.add(6) = #d6; *ptr.add(7) = #d7;
+                    *base.add(0) = #d0; *base.add(1) = #d1;
+                    *base.add(2) = #d2; *base.add(3) = #d3;
+                    *base.add(4) = #d4; *base.add(5) = #d5;
+                    *base.add(6) = #d6; *base.add(7) = #d7;
                 }
-                // Return mutable reference to data
-                Ok(unsafe { &mut *(ptr.add(8) as *mut Self) })
+                // Engage the mutable borrow flag and return the RAII guard over
+                // the data past the discriminator. Fails if already borrowed.
+                // The flag is RELEASED when the returned guard is dropped.
+                arlex_lang::try_account_ref_mut::<Self>(account, 8)
             }
         }
     })
