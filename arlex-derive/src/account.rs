@@ -45,52 +45,57 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
     // Generate PUBKEY_FIELD_OFFSETS: compile-time offsets of all [u8; 32] fields
     // Used by has_one constraint for secure field lookup (no byte-scan).
     //
-    // FINDING 4: If a field's size cannot be computed at macro time (e.g. a
-    // type alias), offsets of all SUBSEQUENT fields are unknown. Previously the
-    // loop silently `break`ed here, dropping any later [u8; 32] pubkey field
-    // from the offset table — has_one would then find no offset and ALWAYS
-    // fail (fail-closed DoS) with no compile-time signal. Now we emit a
-    // compile_error! naming the offending field/type whenever a pubkey field
-    // follows an unsized field, instead of silently truncating.
+    // FINDING 4 (refined): If a field's size cannot be computed at macro time
+    // (e.g. a type alias, or an array of a user struct), offsets of all
+    // SUBSEQUENT fields are unknown. The ORIGINAL Medium bug silently `break`ed
+    // here, dropping any later [u8; 32] pubkey field from the offset table —
+    // has_one would then find no offset and ALWAYS fail (fail-closed DoS) with
+    // no compile-time signal. A first fix hard-errored at the `#[account]`
+    // definition whenever a pubkey followed an unsized field, but that
+    // false-positives: it rejects a struct whose trailing pubkey is NEVER used
+    // in a has_one (e.g. ownership-token's RevenueConfig, whose doc-mandated
+    // layout places `areal_fee_destination: [u8;32]` after a user-struct array
+    // and validates it manually in handlers).
+    //
+    // Refined model: `#[account]` records offsets only for pubkey fields it can
+    // locate (those before the first unsized field) in PUBKEY_FIELD_OFFSETS,
+    // and records the NAMES of the pubkey fields it CANNOT locate (those after
+    // an unsized field) in PUBKEY_FIELDS_UNRESOLVABLE. The struct ALWAYS
+    // compiles. The enforcement moves to the has_one usage site (in
+    // accounts.rs): a `has_one` on a field listed in PUBKEY_FIELDS_UNRESOLVABLE
+    // emits a compile_error there, while a has_one on a resolvable field works
+    // as before. A struct that never uses has_one on the trailing pubkey
+    // compiles cleanly; a has_one on an unresolvable pubkey still fails LOUDLY
+    // at compile time. The security property (no silent fail-closed) is kept.
     let named: Vec<&syn::Field> = named_fields.iter().collect();
     let mut pubkey_offsets = Vec::new();
+    let mut pubkey_unresolvable = Vec::new();
     let mut cumulative_offset: usize = 8; // start after 8-byte discriminator
+    let mut offsets_known = true; // false once we pass a field of unknown size
 
-    for (i, field) in named.iter().enumerate() {
+    for field in named.iter() {
         let field_name = field.ident.as_ref().unwrap().to_string();
         let field_size = type_size(&field.ty);
 
         if is_pubkey_field(&field.ty) {
-            let offset_val = cumulative_offset;
-            pubkey_offsets.push(quote! { (#field_name, #offset_val) });
+            if offsets_known {
+                let offset_val = cumulative_offset;
+                pubkey_offsets.push(quote! { (#field_name, #offset_val) });
+            } else {
+                // This pubkey field follows a field of macro-unknown size, so
+                // its byte offset cannot be computed. Record it as unresolvable
+                // so that any has_one referencing it fails at compile time
+                // rather than silently failing closed at runtime.
+                pubkey_unresolvable.push(quote! { #field_name });
+            }
         }
 
-        if let Some(size) = field_size {
-            cumulative_offset += size;
-        } else {
-            // Unknown type size — offsets of later fields are not computable.
-            // If any later field is a pubkey candidate, the offset table would
-            // be incomplete: refuse to compile rather than silently truncate.
-            let has_later_pubkey = named[i + 1..]
-                .iter()
-                .any(|f| is_pubkey_field(&f.ty));
-            if has_later_pubkey {
-                let ty = &field.ty;
-                let ty_str = quote!(#ty).to_string();
-                return Err(syn::Error::new_spanned(
-                    &field.ty,
-                    format!(
-                        "cannot compute size of field `{}` (type `{}`); the \
-                         has_one offset table would be incomplete because a \
-                         later [u8; 32] pubkey field's offset depends on it — \
-                         use a concrete type with a macro-known size",
-                        field_name, ty_str,
-                    ),
-                ));
-            }
-            // No pubkey fields follow — the table is complete for all existing
-            // pubkey fields; safe to stop computing further offsets.
-            break;
+        match field_size {
+            Some(size) if offsets_known => cumulative_offset += size,
+            // Once a field of unknown size is seen, every later offset is
+            // unknowable. Keep scanning to catch all later pubkey fields, but
+            // stop advancing the (now meaningless) cumulative offset.
+            _ => offsets_known = false,
         }
     }
 
@@ -108,10 +113,24 @@ pub fn generate(input: ItemStruct) -> Result<TokenStream> {
             /// Total space needed (discriminator + data)
             pub const SPACE: usize = 8 + Self::SIZE;
 
-            /// Offsets of all [u8; 32] fields (pubkey candidates) after 8-byte discriminator.
-            /// Used by has_one constraint for compile-time secure field lookup.
+            /// Offsets of all [u8; 32] fields (pubkey candidates) whose byte
+            /// offset the macro could compute (i.e. fields before the first
+            /// field of macro-unknown size), measured after the 8-byte
+            /// discriminator. Used by has_one for compile-time secure lookup.
             pub const PUBKEY_FIELD_OFFSETS: &'static [(&'static str, usize)] = &[
                 #(#pubkey_offsets),*
+            ];
+
+            /// Names of [u8; 32] pubkey fields whose byte offset the macro
+            /// could NOT compute, because a field of macro-unknown size (e.g. a
+            /// type alias or an array of a user struct) precedes them. These
+            /// are intentionally absent from PUBKEY_FIELD_OFFSETS. A `has_one`
+            /// constraint targeting one of these fails at COMPILE time (see
+            /// `accounts.rs`) instead of silently failing closed at runtime
+            /// (the original FINDING 4 Medium bug). Validate such fields
+            /// manually in handlers.
+            pub const PUBKEY_FIELDS_UNRESOLVABLE: &'static [&'static str] = &[
+                #(#pubkey_unresolvable),*
             ];
 
             /// Load account data (read-only).

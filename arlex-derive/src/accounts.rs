@@ -368,6 +368,56 @@ pub fn generate(input: DeriveInput) -> Result<TokenStream> {
 
             let target_field_name = target_name.to_string();
 
+            // FINDING 4 (refined): the offset table built by `#[account]` may
+            // legitimately OMIT a [u8; 32] field whose byte offset the macro
+            // could not compute (a pubkey placed after a field of
+            // macro-unknown size, e.g. a user-struct array). Such a field is
+            // listed in the account type's PUBKEY_FIELDS_UNRESOLVABLE. If a
+            // has_one targets one of those, the runtime lookup below would find
+            // no offset and ALWAYS fail (fail-closed DoS) with no signal — the
+            // original Medium bug. Catch it at COMPILE time here, at the
+            // has_one usage site (the only place that knows both the target
+            // field and that has_one is actually used on it). A has_one on a
+            // resolvable field passes this assertion and behaves as before; a
+            // struct that never uses has_one on an unresolvable field is never
+            // affected. The check is const-evaluated in the consumer crate.
+            let assert_msg = format!(
+                "has_one on `{}` cannot resolve its byte offset because a field \
+                 of macro-unknown size precedes it in `{}` (e.g. a type alias \
+                 or an array of a user struct). Place pubkey fields used in \
+                 has_one before any variable/unknown-size field, or validate \
+                 `{}` manually in the handler instead of via has_one.",
+                target_field_name, acct_type, target_field_name,
+            );
+            pre_validations.push(quote! {
+                const _: () = {
+                    // Compile-time guard: the has_one target must have a
+                    // resolvable offset. Scans the account type's list of
+                    // fields whose offset the macro could NOT compute.
+                    let mut i = 0usize;
+                    let unresolvable = #acct_type::PUBKEY_FIELDS_UNRESOLVABLE;
+                    while i < unresolvable.len() {
+                        let entry = unresolvable[i].as_bytes();
+                        let target = #target_field_name.as_bytes();
+                        if entry.len() == target.len() {
+                            let mut j = 0usize;
+                            let mut same = true;
+                            while j < entry.len() {
+                                if entry[j] != target[j] {
+                                    same = false;
+                                    break;
+                                }
+                                j += 1;
+                            }
+                            // If the target is in the unresolvable set, fail the
+                            // build with a descriptive message at this site.
+                            assert!(!same, #assert_msg);
+                        }
+                        i += 1;
+                    }
+                };
+            });
+
             post_validations.push(quote! {
                 {
                     // Owner check: account must belong to this program
