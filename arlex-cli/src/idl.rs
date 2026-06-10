@@ -1,5 +1,25 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::Path;
+
+/// Compute an 8-byte Anchor-compatible discriminator: `sha256(<prefix><name>)[0..8]`.
+///
+/// Prefixes match arlex-derive (program.rs / account.rs / event.rs) and the TS
+/// client (`client/src/discriminator.ts`) exactly:
+/// - instruction: `global:<snake_case_fn_name>`
+/// - account:     `account:<PascalCaseStructName>`
+/// - event:       `event:<PascalCaseStructName>`
+///
+/// Serialized by serde as a JSON array of 8 numbers (the Anchor convention).
+fn discriminator(prefix: &str, name: &str) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(name.as_bytes());
+    let hash = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&hash[..8]);
+    out
+}
 
 #[derive(Serialize, Default)]
 pub struct Idl {
@@ -20,6 +40,8 @@ pub struct IdlMetadata {
 
 #[derive(Serialize)]
 pub struct IdlInstruction {
+    /// 8-byte Anchor-compatible discriminator: sha256("global:<name>")[0..8].
+    pub discriminator: [u8; 8],
     pub name: String,
     pub accounts: Vec<IdlAccountItem>,
     pub args: Vec<IdlField>,
@@ -44,6 +66,8 @@ pub struct IdlField {
 
 #[derive(Serialize)]
 pub struct IdlAccountDef {
+    /// 8-byte Anchor-compatible discriminator: sha256("account:<Name>")[0..8].
+    pub discriminator: [u8; 8],
     pub name: String,
     #[serde(rename = "type")]
     pub ty: IdlAccountType,
@@ -57,6 +81,8 @@ pub struct IdlAccountType {
 
 #[derive(Serialize)]
 pub struct IdlEvent {
+    /// 8-byte Anchor-compatible discriminator: sha256("event:<Name>")[0..8].
+    pub discriminator: [u8; 8],
     pub name: String,
     pub fields: Vec<IdlField>,
 }
@@ -258,6 +284,7 @@ fn parse_fn_sig(line: &str) -> Option<IdlInstruction> {
     }
 
     Some(IdlInstruction {
+        discriminator: discriminator("global:", &fn_name),
         name: fn_name,
         accounts: Vec::new(),
         args,
@@ -294,6 +321,7 @@ fn parse_account_structs(source: &str, idl: &mut Idl) {
             }
             if depth <= 0 {
                 idl.accounts.push(IdlAccountDef {
+                    discriminator: discriminator("account:", &name),
                     name: name.clone(),
                     ty: IdlAccountType {
                         kind: "struct".into(),
@@ -719,6 +747,7 @@ fn parse_events(source: &str, idl: &mut Idl) {
             }
             if depth <= 0 {
                 idl.events.push(IdlEvent {
+                    discriminator: discriminator("event:", &name),
                     name: name.clone(),
                     fields: std::mem::take(&mut fields),
                 });
@@ -1318,6 +1347,99 @@ pub struct Deposited {
         assert_eq!(idl.events[0].fields.len(), 2);
         assert_eq!(idl.events[0].fields[0].name, "amount");
         assert_eq!(idl.events[0].fields[1].ty, serde_json::json!("publicKey"));
+    }
+
+    // ==================== L2: Anchor-compatible discriminators ====================
+
+    #[test]
+    fn test_discriminator_helper_golden_vectors() {
+        // Pinned bytes — a change to the prefix string or hash would fail loudly.
+        // These match arlex-derive and client/src/discriminator.ts exactly.
+        assert_eq!(
+            discriminator("global:", "initialize"),
+            [175, 175, 109, 31, 13, 152, 155, 237]
+        );
+        assert_eq!(
+            discriminator("account:", "Counter"),
+            [255, 176, 4, 245, 188, 253, 124, 25]
+        );
+        assert_eq!(
+            discriminator("event:", "Deposited"),
+            [111, 141, 26, 45, 161, 35, 100, 57]
+        );
+    }
+
+    #[test]
+    fn test_instruction_discriminator_emitted() {
+        let source = r#"
+#[program]
+pub mod my_program {
+    use super::*;
+    pub fn initialize(ctx: Context<Init>) -> Result<()> { Ok(()) }
+}
+"#;
+        let mut idl = Idl::default();
+        parse_program(source, &mut idl);
+        assert_eq!(idl.instructions.len(), 1);
+        // sha256("global:initialize")[0..8] — matches the TS client.
+        assert_eq!(
+            idl.instructions[0].discriminator,
+            [175, 175, 109, 31, 13, 152, 155, 237]
+        );
+    }
+
+    #[test]
+    fn test_account_discriminator_emitted() {
+        let source = r#"
+#[account]
+pub struct Counter {
+    pub count: u64,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_account_structs(source, &mut idl);
+        assert_eq!(idl.accounts.len(), 1);
+        // sha256("account:Counter")[0..8].
+        assert_eq!(
+            idl.accounts[0].discriminator,
+            [255, 176, 4, 245, 188, 253, 124, 25]
+        );
+    }
+
+    #[test]
+    fn test_event_discriminator_emitted() {
+        let source = r#"
+#[event]
+pub struct Deposited {
+    pub amount: u64,
+}
+"#;
+        let mut idl = Idl::default();
+        parse_events(source, &mut idl);
+        assert_eq!(idl.events.len(), 1);
+        // sha256("event:Deposited")[0..8].
+        assert_eq!(
+            idl.events[0].discriminator,
+            [111, 141, 26, 45, 161, 35, 100, 57]
+        );
+    }
+
+    #[test]
+    fn test_discriminator_serializes_as_u8_array() {
+        let ix = IdlInstruction {
+            discriminator: discriminator("global:", "initialize"),
+            name: "initialize".into(),
+            accounts: Vec::new(),
+            args: Vec::new(),
+            account_context: None,
+        };
+        let json = serde_json::to_value(&ix).unwrap();
+        let disc = &json["discriminator"];
+        assert!(disc.is_array(), "discriminator must serialize as a JSON array");
+        assert_eq!(disc.as_array().unwrap().len(), 8, "exactly 8 elements");
+        // Each element is a u8 number (Anchor convention).
+        assert_eq!(disc[0], serde_json::json!(175));
+        assert_eq!(disc[7], serde_json::json!(237));
     }
 
     // ==================== Additional edge cases ====================
